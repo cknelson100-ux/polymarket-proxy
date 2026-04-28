@@ -42,7 +42,7 @@ const saveStore = (data) => { try { localStorage.setItem(STORAGE_KEY, JSON.strin
 // ── API ───────────────────────────────────────────────────────────────────
 const wakeProxy = async (onDot) => {
   const start = Date.now();
-  while (Date.now() - start < 75000) {
+  while (Date.now() - start < 100000) {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 12000);
