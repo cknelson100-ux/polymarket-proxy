@@ -40,7 +40,7 @@ const wakeProxy = async (onDot) => {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 12000);
-      const res = await fetch(`/proxy?url=${encodeURIComponent("https://data-api.polymarket.com/leaderboard?window=all&limit=1")}`, { signal: ctrl.signal });
+      const res = await fetch(`/proxy?url=${encodeURIComponent("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=1")}`, { signal: ctrl.signal });
       clearTimeout(t);
       if (res.ok) return true;
     } catch {}
@@ -93,7 +93,7 @@ function App() {
       setDots("");
 
       tick("Fetching leaderboard…", 10);
-      const raw = await pmFetch("https://data-api.polymarket.com/leaderboard?window=all&limit=100");
+      const raw = await pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=100");
       const traders = Array.isArray(raw) ? raw : (raw.leaderboard || raw.data || []);
       if (!traders.length) throw new Error("Leaderboard returned no traders.");
 
