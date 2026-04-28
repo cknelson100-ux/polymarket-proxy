@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -20,27 +19,34 @@ body { font-family: 'DM Mono', 'Courier New', monospace; color: #c8d6e5; min-hei
 ::-webkit-scrollbar-thumb { background: #1a2235; border-radius: 2px; }
 tbody tr:hover td { background: rgba(74,222,128,0.025) !important; }
 button:active { opacity: 0.7; }
+input[type=range] { -webkit-appearance: none; height: 3px; background: #1a2235; border-radius: 2px; outline: none; }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #4ade80; border-radius: 50%; cursor: pointer; }
+input[type=number] { background: #0a1020; border: 1px solid #1a2235; color: #c8d6e5; padding: 6px 8px; border-radius: 4px; font-family: inherit; font-size: 12px; width: 60px; }
 </style>
 </head>
 <body>
 <div id="root"></div>
 
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
 <script type="text/babel" data-presets="react">
-const { useState, useCallback } = React;
+const { useState, useEffect, useMemo, useCallback } = React;
 
+// ── STORAGE ───────────────────────────────────────────────────────────────
+const STORAGE_KEY = "polymarket_dashboard_v1";
+const loadStore = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch { return {}; } };
+const saveStore = (data) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {} };
+
+// ── API ───────────────────────────────────────────────────────────────────
 const wakeProxy = async (onDot) => {
   const start = Date.now();
   while (Date.now() - start < 75000) {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 12000);
-      const res = await fetch(`/proxy?url=${encodeURIComponent("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=1")}`, { signal: ctrl.signal });
+      const res = await fetch(`/proxy?url=${encodeURIComponent("https://data-api.polymarket.com/v1/leaderboard?limit=1")}`, { signal: ctrl.signal });
       clearTimeout(t);
       if (res.ok) return true;
     } catch {}
@@ -67,52 +73,80 @@ const aiCall = async (msg) => {
   return d.content?.find(b => b.type === "text")?.text || "";
 };
 
+// ── HELPERS ───────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmtC = (n) => n != null ? (Number(n) * 100).toFixed(0) + "¢" : "—";
-const fmt  = (n) => n != null ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 }) : "—";
+const fmt = (n) => n != null ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 }) : "—";
+const fmtRel = (ts) => {
+  if (!ts) return "never";
+  const s = (Date.now() - ts) / 1000;
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s/60) + "m ago";
+  if (s < 86400) return Math.floor(s/3600) + "h ago";
+  return Math.floor(s/86400) + "d ago";
+};
+const daysUntil = (dateStr) => {
+  if (!dateStr) return null;
+  return Math.round((new Date(dateStr) - Date.now()) / 86400000);
+};
 
+// ── APP ───────────────────────────────────────────────────────────────────
 function App() {
   const [phase, setPhase] = useState("idle");
-  const [prog,  setProg]  = useState(0);
-  const [log,   setLog]   = useState("");
-  const [dots,  setDots]  = useState("");
-  const [result,setResult]= useState(null);
+  const [prog, setProg] = useState(0);
+  const [log, setLog] = useState("");
+  const [dots, setDots] = useState("");
+  const [result, setResult] = useState(null);
+  const [previousScan, setPreviousScan] = useState(null);
   const [brief, setBrief] = useState("");
-  const [tab,   setTab]   = useState("brief");
-  const [sel,   setSel]   = useState(null);
-  const [err,   setErr]   = useState(null);
+  const [tab, setTab] = useState("filtered");
+  const [sel, setSel] = useState(null);
+  const [err, setErr] = useState(null);
+  const [filters, setFilters] = useState({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false });
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  // Load previous scan + last results on mount
+  useEffect(() => {
+    const store = loadStore();
+    if (store.lastResult) {
+      setResult(store.lastResult);
+      setBrief(store.lastBrief || "");
+    }
+    if (store.previousScan) setPreviousScan(store.previousScan);
+  }, []);
 
   const tick = (msg, pct) => { setLog(msg); if (pct != null) setProg(pct); };
 
   const run = useCallback(async () => {
-    setPhase("running"); setErr(null); setResult(null); setBrief(""); setDots("");
+    setPhase("running"); setErr(null); setBrief(""); setDots("");
     try {
       tick("Waking proxy server…", 2);
-      let dotStr = "";
-      await wakeProxy(() => { dotStr += "·"; setDots(dotStr); });
+      let ds = "";
+      await wakeProxy(() => { ds += "·"; setDots(ds); });
       setDots("");
 
-      tick("Fetching leaderboard…", 10);
-    const [page1, page2] = await Promise.all([
-  pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=0"),
-  pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=50"),
-]);
-const arr1 = Array.isArray(page1) ? page1 : (page1.leaderboard || page1.data || []);
-const arr2 = Array.isArray(page2) ? page2 : (page2.leaderboard || page2.data || []);
-const traders = [...arr1, ...arr2];
-
+      // ── 1. LEADERBOARD (paginated) ──────────────────────────────────────
+      tick("Fetching leaderboard…", 8);
+      const [p1, p2] = await Promise.all([
+        pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=0"),
+        pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=50"),
+      ]);
+      const arr1 = Array.isArray(p1) ? p1 : (p1.leaderboard || p1.data || []);
+      const arr2 = Array.isArray(p2) ? p2 : (p2.leaderboard || p2.data || []);
+      const traders = [...arr1, ...arr2];
       if (!traders.length) throw new Error("Leaderboard returned no traders.");
 
       tick(`${traders.length} traders loaded — fetching positions…`, 18);
       await sleep(150);
 
+      // ── 2. POSITIONS ────────────────────────────────────────────────────
       const posMap = {};
-      const top    = traders.slice(0, 100);
-      const BATCH  = 8;
+      const top = traders.slice(0, 100);
+      const BATCH = 8;
 
       for (let i = 0; i < top.length; i += BATCH) {
         const batch = top.slice(i, i + BATCH);
-        const pct   = 18 + Math.round(((i + BATCH) / top.length) * 58);
+        const pct = 18 + Math.round(((i + BATCH) / top.length) * 58);
         tick(`Positions: ${i + 1}–${Math.min(i + BATCH, top.length)} of ${top.length}…`, Math.min(pct, 76));
 
         await Promise.allSettled(batch.map(async (trader, bi) => {
@@ -124,64 +158,119 @@ const traders = [...arr1, ...arr2];
           catch { return; }
           if (!Array.isArray(positions)) return;
 
-          const weight = Math.pow((101 - rank) / 100, 0.7);
+          // ROI-weighted trader weight
+          const vol = Number(trader.vol) || 0;
+          const pnl = Number(trader.pnl) || 0;
+          const roi = vol > 0 ? pnl / vol : 0;
+          const roiBoost = Math.min(3, Math.max(1, 1 + roi));
+          const rankWeight = Math.pow((101 - rank) / 100, 0.7);
+          const traderWeight = rankWeight * roiBoost;
+
           positions.forEach(pos => {
             if (!pos.title || !pos.size || pos.size <= 0) return;
             const key = pos.conditionId || pos.slug || pos.title;
             if (!posMap[key]) {
-              posMap[key] = { title: pos.title, slug: pos.slug, eventSlug: pos.eventSlug, curPrice: pos.curPrice, endDate: pos.endDate, yesT: 0, noT: 0, total: 0, yesS: 0, noS: 0, conv: 0, details: [] };
+              posMap[key] = { title: pos.title, slug: pos.slug, eventSlug: pos.eventSlug, conditionId: pos.conditionId, curPrice: pos.curPrice, endDate: pos.endDate, yesT: 0, noT: 0, total: 0, yesS: 0, noS: 0, conv: 0, entrySum: 0, entryWeight: 0, details: [] };
             }
             const m = posMap[key];
             const isYes = pos.outcome?.toLowerCase() === "yes" || pos.outcomeIndex === 0;
+            const entry = pos.avgPrice || pos.curPrice || 0.5;
             m.total++;
-            m.conv += weight * Math.sqrt(Math.abs(pos.size)) * (pos.curPrice || 0.5);
-            if (isYes) { m.yesT++; m.yesS += pos.size; } else { m.noT++; m.noS += pos.size; }
-            if (rank <= 30) m.details.push({ rank, outcome: pos.outcome || (isYes ? "YES" : "NO"), size: Math.round(pos.size) });
+            m.conv += traderWeight * Math.sqrt(Math.abs(pos.size)) * (pos.curPrice || 0.5);
+            m.entrySum += entry * pos.size;
+            m.entryWeight += pos.size;
+            if (isYes) { m.yesT++; m.yesS += pos.size; }
+            else { m.noT++; m.noS += pos.size; }
+            if (rank <= 30) {
+              m.details.push({ rank, outcome: pos.outcome || (isYes ? "YES" : "NO"), size: Math.round(pos.size), entry: Math.round(entry * 100), roi: (roi * 100).toFixed(0), userName: trader.userName });
+            }
           });
         }));
         await sleep(60);
       }
 
-      tick("Aggregating…", 80);
+      // ── 3. AGGREGATE + COMPARE WITH PREVIOUS ────────────────────────────
+      tick("Aggregating…", 78);
+      const prevMap = previousScan?.markets || {};
+
       const markets = Object.values(posMap)
         .filter(m => m.total >= 2)
         .sort((a, b) => b.conv - a.conv)
-        .slice(0, 40)
+        .slice(0, 60)
         .map(m => {
           const tot = m.yesS + m.noS;
           const yesPct = tot > 0 ? Math.round((m.yesS / tot) * 100) : 50;
           const rec = yesPct >= 50 ? "YES" : "NO";
-          return { ...m, totalTraders: m.total, yesPct, recommendation: rec, dominancePct: rec === "YES" ? yesPct : 100 - yesPct, conviction: Math.round(m.conv * 10) / 10 };
+          const avgEntry = m.entryWeight > 0 ? m.entrySum / m.entryWeight : null;
+          const key = m.conditionId || m.slug;
+          const prev = prevMap[key];
+          const tradersDelta = prev ? m.total - (prev.total || 0) : null;
+          const priceDelta = (prev && prev.curPrice && m.curPrice) ? m.curPrice - prev.curPrice : null;
+          const isNew = !prev;
+          return {
+            ...m,
+            totalTraders: m.total, yesPct, recommendation: rec,
+            dominancePct: rec === "YES" ? yesPct : 100 - yesPct,
+            conviction: Math.round(m.conv * 10) / 10,
+            avgEntry, tradersDelta, priceDelta, isNew,
+          };
         });
 
       if (!markets.length) throw new Error("No overlapping positions found.");
-      setResult({ traders: top.length, markets });
 
-      tick("Generating brief…", 86);
-      const topSummary = markets.slice(0, 12).map(m => ({ title: m.title, traders: m.totalTraders, signal: m.recommendation, sentiment: m.dominancePct + "% " + m.recommendation, price: m.curPrice ? fmtC(m.curPrice) : "?", conviction: m.conviction, endDate: m.endDate?.split("T")[0] || "?" }));
+      const newResult = { traders: top.length, markets, timestamp: Date.now() };
+      setResult(newResult);
+
+      // Persist: current → lastResult, current snapshot → previousScan for next time
+      const snapshot = { timestamp: Date.now(), markets: Object.fromEntries(markets.map(m => [m.conditionId || m.slug, { total: m.total, curPrice: m.curPrice }])) };
+      saveStore({ lastResult: newResult, previousScan: snapshot, lastBrief: "" });
+      setPreviousScan(snapshot);
+
+      // ── 4. AI BRIEF ─────────────────────────────────────────────────────
+      tick("Generating investment brief…", 86);
+      const filtered = markets.filter(m => {
+        const cents = (m.curPrice || 0) * 100;
+        return cents >= 25 && cents <= 75 && m.totalTraders >= 5;
+      }).slice(0, 10);
+
+      const summary = (filtered.length ? filtered : markets.slice(0, 10)).map(m => ({
+        title: m.title, traders: m.totalTraders, signal: m.recommendation,
+        sentiment: m.dominancePct + "% " + m.recommendation,
+        price: m.curPrice ? fmtC(m.curPrice) : "?",
+        avgEntry: m.avgEntry ? fmtC(m.avgEntry) : "?",
+        priceVsEntry: m.avgEntry && m.curPrice ? Math.round((m.curPrice - m.avgEntry) * 100) + "¢" : "?",
+        conviction: m.conviction,
+        endDate: m.endDate?.split("T")[0] || "?",
+        isNew: m.isNew, newTraders: m.tradersDelta,
+      }));
 
       try {
         const briefText = await aiCall(
-`You are a sharp Polymarket investment analyst. This is REAL live data — open positions from the top 100 Polymarket traders right now, ranked by all-time profit. Conviction = rank-weighted position size.
+`You are a sharp Polymarket investment analyst. This is REAL live data from the top 100 traders, ALREADY filtered to actionable markets (price 25-75¢, 5+ traders). avgEntry = where smart money entered. priceVsEntry = how much price has moved since they entered (positive = late to the trade, negative = trading below their entry = potential discount).
 
-${JSON.stringify(topSummary, null, 2)}
+${JSON.stringify(summary, null, 2)}
 
 Write a crisp investment brief in EXACTLY this plain-text format:
 
 TOP PICKS:
-→ [Market name] — [YES/NO] @ [price]. [Why smart money is here, 1 sentence.] Risk: [one risk].
-→ [Second pick, same format]
-→ [Third pick, same format]
+→ [Market] — [YES/NO] @ [price]. Smart money entered @ [avgEntry], so you'd be [getting in at discount/paying premium of X¢]. [Why this is a real opportunity in 1 sentence.] Risk: [one risk].
+→ [Second pick]
+→ [Third pick]
+
+FRESH:
+[Mention any markets where isNew=true or newTraders>0 — these are positions smart money is actively building right now]
 
 FADE:
-[1-2 sentences on anything crowded or worth avoiding]
+[1-2 sentences on anything overcrowded or where price has run too far past entry]
 
 EDGE:
-[1-2 sentences on the overall theme of smart money allocation right now]`
+[1-2 sentences on overall pattern]`
         );
         setBrief(briefText);
+        const store = loadStore();
+        saveStore({ ...store, lastBrief: briefText });
       } catch (aiErr) {
-        setBrief("AI brief unavailable: " + aiErr.message + "\n\nTo enable AI analysis, add ANTHROPIC_API_KEY environment variable on Render.");
+        setBrief("AI brief unavailable: " + aiErr.message);
       }
 
       tick("Done.", 100);
@@ -189,11 +278,25 @@ EDGE:
     } catch (e) {
       setErr(e.message); setPhase("error");
     }
-  }, []);
+  }, [previousScan]);
+
+  // ── FILTERED MARKETS ────────────────────────────────────────────────────
+  const filteredMarkets = useMemo(() => {
+    if (!result) return [];
+    return result.markets.filter(m => {
+      const cents = (m.curPrice || 0) * 100;
+      if (cents < filters.minPrice || cents > filters.maxPrice) return false;
+      if (m.totalTraders < filters.minTraders) return false;
+      const days = daysUntil(m.endDate);
+      if (days != null && (days < 0 || days > filters.maxDays)) return false;
+      if (filters.freshOnly && !m.isNew && !((m.tradersDelta || 0) > 0)) return false;
+      return true;
+    });
+  }, [result, filters]);
 
   const running = phase === "running";
   const markets = result?.markets || [];
-  const top = markets[0];
+  const top = filteredMarkets[0] || markets[0];
 
   const S = {
     root: { fontFamily: "'DM Mono','Courier New',monospace", background: "#080b12", color: "#c8d6e5", minHeight: "100vh" },
@@ -215,27 +318,54 @@ EDGE:
     th: { fontSize: "9px", letterSpacing: "2px", textTransform: "uppercase", color: "#2a3a50", textAlign: "left", padding: "8px 8px", borderBottom: "1px solid #1a2235", whiteSpace: "nowrap" },
     td: { padding: "9px 8px", fontSize: "11px", borderBottom: "1px solid #0f1e30", verticalAlign: "middle" },
     badge: (s) => ({ background: s === "YES" ? "rgba(74,222,128,0.1)" : "rgba(248,113,113,0.1)", color: s === "YES" ? "#4ade80" : "#f87171", border: `1px solid ${s === "YES" ? "#4ade80" : "#f87171"}`, borderRadius: "3px", padding: "2px 6px", fontSize: "9px", letterSpacing: "1px" }),
+    newBadge: { background: "rgba(251,191,36,0.15)", color: "#fbbf24", border: "1px solid rgba(251,191,36,0.4)", borderRadius: "3px", padding: "1px 5px", fontSize: "8px", letterSpacing: "1px", marginLeft: "4px" },
     sBar: { display: "flex", height: "4px", borderRadius: "2px", overflow: "hidden", width: "60px", marginTop: "3px" },
     errBox: { background: "rgba(248,113,113,0.06)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: "6px", padding: "16px", color: "#f87171", fontSize: "12px", lineHeight: "1.7" },
     overlay: { position: "fixed", inset: 0, background: "rgba(8,11,18,0.92)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: "16px" },
     modal: { background: "#0d1826", border: "1px solid #1a2235", borderRadius: "8px", padding: "20px", maxWidth: "520px", width: "100%", maxHeight: "85vh", overflowY: "auto" },
+    filterPanel: { background: "#0a1020", border: "1px solid #1a2235", borderRadius: "6px", padding: "14px", marginBottom: "12px" },
+    filterRow: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px", gap: "10px" },
   };
+
+  const Row = ({ m, i }) => (
+    <tr onClick={() => setSel(m)} style={{ cursor: "pointer" }}>
+      <td style={{ ...S.td, color: "#2a3a50", fontSize: "10px" }}>{i+1}</td>
+      <td style={{ ...S.td, maxWidth: "180px" }}>
+        <div style={{ fontSize: "11px", color: "#c8d6e5", lineHeight: "1.3" }}>
+          {m.title}
+          {m.isNew && <span style={S.newBadge}>NEW</span>}
+          {m.tradersDelta > 0 && <span style={S.newBadge}>+{m.tradersDelta}</span>}
+        </div>
+      </td>
+      <td style={S.td}><span style={S.badge(m.recommendation)}>{m.recommendation}</span></td>
+      <td style={{ ...S.td, color: "#c8d6e5" }}>{m.curPrice ? fmtC(m.curPrice) : "—"}</td>
+      <td style={{ ...S.td, color: "#9db8d4" }}>{m.totalTraders}</td>
+      <td style={S.td}>
+        <div style={{ fontSize: "10px", color: m.yesPct >= 50 ? "#4ade80" : "#f87171" }}>{m.yesPct}%</div>
+        <div style={S.sBar}>
+          <div style={{ width: m.yesPct+"%", background: "#4ade80" }}/>
+          <div style={{ width: (100-m.yesPct)+"%", background: "#f87171" }}/>
+        </div>
+      </td>
+      <td style={{ ...S.td, color: "#22d3ee", fontWeight: "700" }}>{m.conviction}</td>
+    </tr>
+  );
 
   return (
     <div style={S.root}>
       <div style={S.hdr}>
         <div><span style={S.logo}>⬡ SMART MONEY</span><span style={S.sub}>TOP 100 · LIVE</span></div>
         <button style={S.btn} disabled={running} onClick={run}>
-          {running ? "● SCANNING" : phase === "done" ? "↺ REFRESH" : "▶ RUN SCAN"}
+          {running ? "● SCANNING" : phase === "done" || result ? "↺ REFRESH" : "▶ RUN SCAN"}
         </button>
       </div>
 
       <div style={S.body}>
-        {phase === "idle" && (
+        {phase === "idle" && !result && (
           <div style={{ textAlign: "center", padding: "60px 20px", color: "#2a3a50" }}>
             <div style={{ fontSize: "52px", marginBottom: "14px", opacity: 0.2 }}>⬡</div>
             <div style={{ fontSize: "11px", letterSpacing: "3px", marginBottom: "8px" }}>POLYMARKET SMART MONEY SCANNER</div>
-            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>Real positions · Top 100 traders · Live data</div>
+            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>ROI-weighted · Filtered · Tracks deltas</div>
           </div>
         )}
 
@@ -256,15 +386,22 @@ EDGE:
           </div>
         )}
 
-        {phase === "done" && result && (
+        {result && (
           <>
+            {/* Stats */}
             <div style={S.statsRow}>
-              <div style={S.card()}><div style={S.lbl}>Traders</div><div style={S.val}>{result.traders}</div></div>
-              <div style={S.card()}><div style={S.lbl}>Markets</div><div style={S.val}>{markets.length}</div></div>
+              <div style={S.card()}>
+                <div style={S.lbl}>Filtered Picks</div>
+                <div style={S.val}>{filteredMarkets.length}<span style={{ fontSize: "12px", color: "#2a3a50", marginLeft: "6px" }}>of {markets.length}</span></div>
+              </div>
+              <div style={S.card()}>
+                <div style={S.lbl}>Last Scan</div>
+                <div style={{ fontSize: "14px", color: "#c8d6e5", marginTop: "6px", fontWeight: "700" }}>{fmtRel(result.timestamp)}</div>
+              </div>
             </div>
             <div style={S.statsRow3}>
               <div style={S.card(top?.recommendation === "YES" ? "rgba(74,222,128,0.25)" : "rgba(248,113,113,0.25)")}>
-                <div style={S.lbl}>Top Conviction Play</div>
+                <div style={S.lbl}>Top Filtered Pick</div>
                 <div style={{ fontSize: "12px", color: top?.recommendation === "YES" ? "#4ade80" : "#f87171", marginTop: "6px", lineHeight: "1.4", fontWeight: "700" }}>
                   {top?.title?.slice(0, 56)}{top?.title?.length > 56 ? "…" : ""}
                   <span style={{ fontSize: "10px", marginLeft: "6px", opacity: 0.7 }}>{top?.recommendation} @ {top?.curPrice ? fmtC(top.curPrice) : "?"}</span>
@@ -272,73 +409,86 @@ EDGE:
               </div>
             </div>
 
+            {/* Filter panel */}
+            <div style={S.filterPanel}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }} onClick={() => setFiltersOpen(!filtersOpen)}>
+                <div style={{ fontSize: "10px", letterSpacing: "2px", color: "#4ade80", textTransform: "uppercase" }}>
+                  ▾ Filters · {filters.minPrice}–{filters.maxPrice}¢ · {filters.minTraders}+ traders · ≤{filters.maxDays}d
+                </div>
+                <div style={{ fontSize: "9px", color: "#2a3a50" }}>{filtersOpen ? "tap to hide" : "tap to edit"}</div>
+              </div>
+              {filtersOpen && (
+                <div style={{ marginTop: "14px" }}>
+                  <div style={S.filterRow}>
+                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Price range</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                      <input type="number" min="0" max="100" value={filters.minPrice} onChange={e => setFilters({ ...filters, minPrice: +e.target.value })}/>
+                      <span style={{ color: "#2a3a50", fontSize: "10px" }}>–</span>
+                      <input type="number" min="0" max="100" value={filters.maxPrice} onChange={e => setFilters({ ...filters, maxPrice: +e.target.value })}/>
+                      <span style={{ color: "#2a3a50", fontSize: "10px" }}>¢</span>
+                    </div>
+                  </div>
+                  <div style={S.filterRow}>
+                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Min traders</div>
+                    <input type="number" min="1" max="50" value={filters.minTraders} onChange={e => setFilters({ ...filters, minTraders: +e.target.value })}/>
+                  </div>
+                  <div style={S.filterRow}>
+                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Max days to resolve</div>
+                    <input type="number" min="1" max="365" value={filters.maxDays} onChange={e => setFilters({ ...filters, maxDays: +e.target.value })}/>
+                  </div>
+                  <div style={S.filterRow}>
+                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Fresh signals only</div>
+                    <button onClick={() => setFilters({ ...filters, freshOnly: !filters.freshOnly })}
+                      style={{ background: filters.freshOnly ? "#4ade80" : "#101c2c", color: filters.freshOnly ? "#060a0f" : "#9db8d4", border: "none", borderRadius: "4px", padding: "5px 12px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
+                      {filters.freshOnly ? "ON" : "OFF"}
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: "6px", marginTop: "10px" }}>
+                    <button onClick={() => setFilters({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false })}
+                      style={{ background: "#101c2c", color: "#9db8d4", border: "none", borderRadius: "4px", padding: "6px 10px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>Reset</button>
+                    <button onClick={() => setFilters({ minPrice: 0, maxPrice: 100, minTraders: 1, maxDays: 365, freshOnly: false })}
+                      style={{ background: "#101c2c", color: "#9db8d4", border: "none", borderRadius: "4px", padding: "6px 10px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>Show all</button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div style={S.tabRow}>
-              {[["brief","Brief"],["markets","Markets"],["top10","Top 10"]].map(([id,lbl]) => (
+              {[["filtered","Filtered"],["brief","AI Brief"],["all","All Markets"]].map(([id,lbl]) => (
                 <button key={id} style={S.tab(tab===id)} onClick={() => setTab(id)}>{lbl}</button>
               ))}
             </div>
 
-            {tab === "brief" && <div style={S.panel}>{brief || "—"}</div>}
+            {tab === "brief" && <div style={S.panel}>{brief || "Run a scan to generate brief."}</div>}
 
-            {tab === "markets" && (
+            {tab === "filtered" && (
               <div style={{ overflowX: "auto", margin: "0 -16px", padding: "0 16px" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead><tr>{["#","Market","Sig","Price","T","Y%","Conv"].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
-                  <tbody>
-                    {markets.map((m,i) => (
-                      <tr key={i} onClick={() => setSel(m)} style={{ cursor: "pointer" }}>
-                        <td style={{ ...S.td, color: "#2a3a50", fontSize: "10px" }}>{i+1}</td>
-                        <td style={{ ...S.td, maxWidth: "200px" }}>
-                          <div style={{ fontSize: "11px", color: "#c8d6e5", lineHeight: "1.3" }}>{m.title}</div>
-                        </td>
-                        <td style={S.td}><span style={S.badge(m.recommendation)}>{m.recommendation}</span></td>
-                        <td style={{ ...S.td, color: "#c8d6e5" }}>{m.curPrice ? fmtC(m.curPrice) : "—"}</td>
-                        <td style={{ ...S.td, color: "#9db8d4" }}>{m.totalTraders}</td>
-                        <td style={S.td}>
-                          <div style={{ fontSize: "10px", color: m.yesPct >= 50 ? "#4ade80" : "#f87171" }}>{m.yesPct}%</div>
-                          <div style={S.sBar}>
-                            <div style={{ width: m.yesPct+"%", background: "#4ade80" }}/>
-                            <div style={{ width: (100-m.yesPct)+"%", background: "#f87171" }}/>
-                          </div>
-                        </td>
-                        <td style={{ ...S.td, color: "#22d3ee", fontWeight: "700" }}>{m.conviction}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                {filteredMarkets.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: "40px 20px", color: "#2a3a50", fontSize: "11px" }}>
+                    No markets match your filters.<br/>Loosen criteria above or hit "Show all".
+                  </div>
+                ) : (
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead><tr>{["#","Market","Sig","Price","T","Y%","Conv"].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                    <tbody>{filteredMarkets.map((m,i) => <Row key={m.conditionId||i} m={m} i={i}/>)}</tbody>
+                  </table>
+                )}
               </div>
             )}
 
-            {tab === "top10" && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "10px" }}>
-                {markets.slice(0,10).map((m,i) => (
-                  <div key={i} onClick={() => setSel(m)} style={{ ...S.card(m.recommendation==="YES"?"rgba(74,222,128,0.18)":"rgba(248,113,113,0.18)"), cursor: "pointer" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "10px" }}>
-                      <span style={{ fontSize: "9px", color: "#2a3a50" }}>#{i+1}</span>
-                      <span style={S.badge(m.recommendation)}>{m.recommendation}</span>
-                    </div>
-                    <div style={{ fontSize: "12px", color: "#c8d6e5", lineHeight: "1.4", marginBottom: "12px" }}>{m.title}</div>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px", marginBottom: "10px" }}>
-                      {[["Price",m.curPrice?fmtC(m.curPrice):"—"],["Traders",m.totalTraders],["Score",m.conviction]].map(([l,v]) => (
-                        <div key={l}>
-                          <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px" }}>{l}</div>
-                          <div style={{ fontSize: "13px", color: "#c8d6e5", fontWeight: "700" }}>{v}</div>
-                        </div>
-                      ))}
-                    </div>
-                    <div style={S.sBar}>
-                      <div style={{ width: m.yesPct+"%", background: "#4ade80" }}/>
-                      <div style={{ width: (100-m.yesPct)+"%", background: "#f87171" }}/>
-                    </div>
-                    <div style={{ fontSize: "9px", color: "#2a3a50", marginTop: "4px" }}>YES {m.yesPct}% · NO {100-m.yesPct}%</div>
-                  </div>
-                ))}
+            {tab === "all" && (
+              <div style={{ overflowX: "auto", margin: "0 -16px", padding: "0 16px" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>{["#","Market","Sig","Price","T","Y%","Conv"].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                  <tbody>{markets.map((m,i) => <Row key={m.conditionId||i} m={m} i={i}/>)}</tbody>
+                </table>
               </div>
             )}
           </>
         )}
       </div>
 
+      {/* Detail modal */}
       {sel && (
         <div style={S.overlay} onClick={() => setSel(null)}>
           <div style={S.modal} onClick={e => e.stopPropagation()}>
@@ -346,15 +496,19 @@ EDGE:
               <span style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" }}>Market Detail</span>
               <button style={{ background: "none", border: "none", color: "#2a3a50", cursor: "pointer", fontSize: "16px" }} onClick={() => setSel(null)}>✕</button>
             </div>
-            <div style={{ fontSize: "14px", color: "#c8d6e5", lineHeight: "1.5", marginBottom: "16px" }}>{sel.title}</div>
+            <div style={{ fontSize: "14px", color: "#c8d6e5", lineHeight: "1.5", marginBottom: "16px" }}>
+              {sel.title}
+              {sel.isNew && <span style={S.newBadge}>NEW</span>}
+              {sel.tradersDelta > 0 && <span style={S.newBadge}>+{sel.tradersDelta} TRADERS</span>}
+            </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "14px" }}>
               {[
                 { l:"Signal", v:sel.recommendation, c:sel.recommendation==="YES"?"#4ade80":"#f87171" },
-                { l:"Price",  v:sel.curPrice?fmtC(sel.curPrice):"—" },
-                { l:"Conv",   v:sel.conviction },
-                { l:"Traders",v:sel.totalTraders },
-                { l:"YES",    v:sel.yesT },
-                { l:"NO",     v:sel.noT },
+                { l:"Price", v:sel.curPrice?fmtC(sel.curPrice):"—" },
+                { l:"Avg entry", v:sel.avgEntry?fmtC(sel.avgEntry):"—", c: "#fbbf24" },
+                { l:"Traders", v:sel.totalTraders },
+                { l:"YES", v:sel.yesT },
+                { l:"NO", v:sel.noT },
               ].map(({l,v,c}) => (
                 <div key={l} style={{ background: "#0a1020", borderRadius: "4px", padding: "10px" }}>
                   <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px", marginBottom: "3px" }}>{l}</div>
@@ -362,6 +516,19 @@ EDGE:
                 </div>
               ))}
             </div>
+
+            {sel.avgEntry && sel.curPrice && (
+              <div style={{ background: "#0a1020", borderRadius: "4px", padding: "10px", marginBottom: "14px" }}>
+                <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px", marginBottom: "3px" }}>Price vs smart-money entry</div>
+                <div style={{ fontSize: "12px", color: sel.curPrice > sel.avgEntry ? "#f87171" : "#4ade80", fontWeight: "700" }}>
+                  {sel.curPrice > sel.avgEntry ? "↑" : "↓"} {Math.abs(Math.round((sel.curPrice - sel.avgEntry) * 100))}¢ {sel.curPrice > sel.avgEntry ? "ABOVE" : "BELOW"} entry
+                  <span style={{ fontSize: "10px", color: "#2a3a50", marginLeft: "6px", fontWeight: "400" }}>
+                    ({sel.curPrice > sel.avgEntry ? "you'd be late" : "you'd be early"})
+                  </span>
+                </div>
+              </div>
+            )}
+
             <div style={S.sBar}>
               <div style={{ width: sel.yesPct+"%", background: "#4ade80" }}/>
               <div style={{ width: (100-sel.yesPct)+"%", background: "#f87171" }}/>
@@ -369,19 +536,22 @@ EDGE:
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: "9px", color: "#2a3a50", marginTop: "4px", marginBottom: "14px" }}>
               <span>YES {sel.yesPct}%</span><span>NO {100-sel.yesPct}%</span>
             </div>
+
             {sel.details?.length > 0 && (
               <>
                 <div style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase", marginBottom: "8px" }}>Top Trader Positions</div>
                 {sel.details.slice(0,8).map((t,i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #0f1e30", fontSize: "11px" }}>
-                    <span style={{ color: "#2a3a50" }}>Rank #{t.rank}</span>
-                    <span style={{ color: t.outcome?.toUpperCase()==="YES"?"#4ade80":"#f87171" }}>{t.outcome?.toUpperCase()}</span>
-                    <span style={{ color: "#c8d6e5" }}>{fmt(t.size)}</span>
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #0f1e30", fontSize: "10px" }}>
+                    <span style={{ color: "#2a3a50", minWidth: "40px" }}>#{t.rank}</span>
+                    <span style={{ color: t.outcome?.toUpperCase()==="YES"?"#4ade80":"#f87171", minWidth: "30px" }}>{t.outcome?.toUpperCase()}</span>
+                    <span style={{ color: "#c8d6e5", minWidth: "60px" }}>{fmt(t.size)}</span>
+                    <span style={{ color: "#fbbf24" }}>@{t.entry}¢</span>
+                    <span style={{ color: "#22d3ee" }}>{t.roi}% ROI</span>
                   </div>
                 ))}
               </>
             )}
-            {sel.endDate && <div style={{ fontSize: "10px", color: "#2a3a50", marginTop: "12px" }}>Resolves: {sel.endDate.split("T")[0]}</div>}
+            {sel.endDate && <div style={{ fontSize: "10px", color: "#2a3a50", marginTop: "12px" }}>Resolves: {sel.endDate.split("T")[0]} ({daysUntil(sel.endDate)}d)</div>}
             {(sel.eventSlug||sel.slug) && (
               <a href={`https://polymarket.com/event/${sel.eventSlug||sel.slug}`} target="_blank" rel="noopener noreferrer" style={{ display: "inline-block", marginTop: "10px", fontSize: "10px", color: "#22d3ee", textDecoration: "none", letterSpacing: "1px" }}>VIEW ON POLYMARKET →</a>
             )}
@@ -394,6 +564,5 @@ EDGE:
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
-
 </body>
 </html>
