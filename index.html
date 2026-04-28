@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Smart Money">
+<meta name="theme-color" content="#080b12">
+<title>Smart Money · Polymarket Top 100</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body { background: #080b12; height: 100%; }
+body { font-family: 'DM Mono', 'Courier New', monospace; color: #c8d6e5; min-height: 100vh; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #080b12; }
+::-webkit-scrollbar-thumb { background: #1a2235; border-radius: 2px; }
+tbody tr:hover td { background: rgba(74,222,128,0.025) !important; }
+button:active { opacity: 0.7; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useCallback } = React;
+
+const wakeProxy = async (onDot) => {
+  const start = Date.now();
+  while (Date.now() - start < 75000) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 12000);
+      const res = await fetch(`/proxy?url=${encodeURIComponent("https://data-api.polymarket.com/leaderboard?window=all&limit=1")}`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok) return true;
+    } catch {}
+    onDot();
+    await new Promise(r => setTimeout(r, 4000));
+  }
+  throw new Error("Proxy did not wake up.");
+};
+
+const pmFetch = async (url) => {
+  const res = await fetch(`/proxy?url=${encodeURIComponent(url)}`);
+  if (!res.ok) throw new Error(`Proxy ${res.status}`);
+  return res.json();
+};
+
+const aiCall = async (msg) => {
+  const res = await fetch("/ai", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1500, messages: [{ role: "user", content: msg }] }),
+  });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `AI ${res.status}`); }
+  const d = await res.json();
+  return d.content?.find(b => b.type === "text")?.text || "";
+};
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const fmtC = (n) => n != null ? (Number(n) * 100).toFixed(0) + "¢" : "—";
+const fmt  = (n) => n != null ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 }) : "—";
+
+function App() {
+  const [phase, setPhase] = useState("idle");
+  const [prog,  setProg]  = useState(0);
+  const [log,   setLog]   = useState("");
+  const [dots,  setDots]  = useState("");
+  const [result,setResult]= useState(null);
+  const [brief, setBrief] = useState("");
+  const [tab,   setTab]   = useState("brief");
+  const [sel,   setSel]   = useState(null);
+  const [err,   setErr]   = useState(null);
+
+  const tick = (msg, pct) => { setLog(msg); if (pct != null) setProg(pct); };
+
+  const run = useCallback(async () => {
+    setPhase("running"); setErr(null); setResult(null); setBrief(""); setDots("");
+    try {
+      tick("Waking proxy server…", 2);
+      let dotStr = "";
+      await wakeProxy(() => { dotStr += "·"; setDots(dotStr); });
+      setDots("");
+
+      tick("Fetching leaderboard…", 10);
+      const raw = await pmFetch("https://data-api.polymarket.com/leaderboard?window=all&limit=100");
+      const traders = Array.isArray(raw) ? raw : (raw.leaderboard || raw.data || []);
+      if (!traders.length) throw new Error("Leaderboard returned no traders.");
+
+      tick(`${traders.length} traders loaded — fetching positions…`, 18);
+      await sleep(150);
+
+      const posMap = {};
+      const top    = traders.slice(0, 100);
+      const BATCH  = 8;
+
+      for (let i = 0; i < top.length; i += BATCH) {
+        const batch = top.slice(i, i + BATCH);
+        const pct   = 18 + Math.round(((i + BATCH) / top.length) * 58);
+        tick(`Positions: ${i + 1}–${Math.min(i + BATCH, top.length)} of ${top.length}…`, Math.min(pct, 76));
+
+        await Promise.allSettled(batch.map(async (trader, bi) => {
+          const rank = i + bi + 1;
+          const addr = trader.proxyWallet || trader.address || trader.wallet;
+          if (!addr) return;
+          let positions;
+          try { positions = await pmFetch(`https://data-api.polymarket.com/positions?user=${addr}&sizeThreshold=0.05`); }
+          catch { return; }
+          if (!Array.isArray(positions)) return;
+
+          const weight = Math.pow((101 - rank) / 100, 0.7);
+          positions.forEach(pos => {
+            if (!pos.title || !pos.size || pos.size <= 0) return;
+            const key = pos.conditionId || pos.slug || pos.title;
+            if (!posMap[key]) {
+              posMap[key] = { title: pos.title, slug: pos.slug, eventSlug: pos.eventSlug, curPrice: pos.curPrice, endDate: pos.endDate, yesT: 0, noT: 0, total: 0, yesS: 0, noS: 0, conv: 0, details: [] };
+            }
+            const m = posMap[key];
+            const isYes = pos.outcome?.toLowerCase() === "yes" || pos.outcomeIndex === 0;
+            m.total++;
+            m.conv += weight * Math.sqrt(Math.abs(pos.size)) * (pos.curPrice || 0.5);
+            if (isYes) { m.yesT++; m.yesS += pos.size; } else { m.noT++; m.noS += pos.size; }
+            if (rank <= 30) m.details.push({ rank, outcome: pos.outcome || (isYes ? "YES" : "NO"), size: Math.round(pos.size) });
+          });
+        }));
+        await sleep(60);
+      }
+
+      tick("Aggregating…", 80);
+      const markets = Object.values(posMap)
+        .filter(m => m.total >= 2)
+        .sort((a, b) => b.conv - a.conv)
+        .slice(0, 40)
+        .map(m => {
+          const tot = m.yesS + m.noS;
+          const yesPct = tot > 0 ? Math.round((m.yesS / tot) * 100) : 50;
+          const rec = yesPct >= 50 ? "YES" : "NO";
+          return { ...m, totalTraders: m.total, yesPct, recommendation: rec, dominancePct: rec === "YES" ? yesPct : 100 - yesPct, conviction: Math.round(m.conv * 10) / 10 };
+        });
+
+      if (!markets.length) throw new Error("No overlapping positions found.");
+      setResult({ traders: top.length, markets });
+
+      tick("Generating brief…", 86);
+      const topSummary = markets.slice(0, 12).map(m => ({ title: m.title, traders: m.totalTraders, signal: m.recommendation, sentiment: m.dominancePct + "% " + m.recommendation, price: m.curPrice ? fmtC(m.curPrice) : "?", conviction: m.conviction, endDate: m.endDate?.split("T")[0] || "?" }));
+
+      try {
+        const briefText = await aiCall(
+`You are a sharp Polymarket investment analyst. This is REAL live data — open positions from the top 100 Polymarket traders right now, ranked by all-time profit. Conviction = rank-weighted position size.
+
+${JSON.stringify(topSummary, null, 2)}
+
+Write a crisp investment brief in EXACTLY this plain-text format:
+
+TOP PICKS:
+→ [Market name] — [YES/NO] @ [price]. [Why smart money is here, 1 sentence.] Risk: [one risk].
+→ [Second pick, same format]
+→ [Third pick, same format]
+
+FADE:
+[1-2 sentences on anything crowded or worth avoiding]
+
+EDGE:
+[1-2 sentences on the overall theme of smart money allocation right now]`
+        );
+        setBrief(briefText);
+      } catch (aiErr) {
+        setBrief("AI brief unavailable: " + aiErr.message + "\n\nTo enable AI analysis, add ANTHROPIC_API_KEY environment variable on Render.");
+      }
+
+      tick("Done.", 100);
+      setPhase("done");
+    } catch (e) {
+      setErr(e.message); setPhase("error");
+    }
+  }, []);
+
+  const running = phase === "running";
+  const markets = result?.markets || [];
+  const top = markets[0];
+
+  const S = {
+    root: { fontFamily: "'DM Mono','Courier New',monospace", background: "#080b12", color: "#c8d6e5", minHeight: "100vh" },
+    hdr: { borderBottom: "1px solid #1a2235", padding: "14px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#08111f", position: "sticky", top: 0, zIndex: 50 },
+    logo: { fontSize: "11px", letterSpacing: "3px", color: "#4ade80", textTransform: "uppercase", fontWeight: "700" },
+    sub: { color: "#2a3a50", marginLeft: "8px", fontSize: "9px" },
+    btn: { background: running ? "#101c2c" : "linear-gradient(135deg,#4ade80,#22c55e)", color: running ? "#2a3a50" : "#060a0f", border: "none", borderRadius: "4px", padding: "8px 14px", fontSize: "10px", letterSpacing: "1.5px", textTransform: "uppercase", cursor: running ? "not-allowed" : "pointer", fontFamily: "'DM Mono',monospace", fontWeight: "700" },
+    body: { padding: "16px", maxWidth: "1060px", margin: "0 auto" },
+    progBox: { margin: "16px 0", background: "#0d1826", border: "1px solid #1a2235", borderRadius: "6px", padding: "16px" },
+    bar: { height: "3px", background: "#1a2235", borderRadius: "2px", marginTop: "10px", overflow: "hidden" },
+    statsRow: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginBottom: "10px" },
+    statsRow3: { display: "grid", gridTemplateColumns: "1fr", gap: "8px", marginBottom: "14px" },
+    card: (a) => ({ background: "#0d1826", border: `1px solid ${a || "#1a2235"}`, borderRadius: "6px", padding: "12px" }),
+    lbl: { fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" },
+    val: { fontSize: "20px", color: "#c8d6e5", marginTop: "4px", fontWeight: "700" },
+    tabRow: { display: "flex", borderBottom: "1px solid #1a2235", marginBottom: "12px", overflowX: "auto" },
+    tab: (a) => ({ padding: "8px 14px", fontSize: "10px", letterSpacing: "2px", textTransform: "uppercase", cursor: "pointer", background: "none", border: "none", borderBottom: a ? "2px solid #4ade80" : "2px solid transparent", color: a ? "#4ade80" : "#2a3a50", fontFamily: "'DM Mono',monospace", whiteSpace: "nowrap" }),
+    panel: { background: "#0d1826", border: "1px solid #1a2235", borderRadius: "6px", padding: "16px", lineHeight: "1.8", fontSize: "12px", color: "#9db8d4", whiteSpace: "pre-wrap" },
+    th: { fontSize: "9px", letterSpacing: "2px", textTransform: "uppercase", color: "#2a3a50", textAlign: "left", padding: "8px 8px", borderBottom: "1px solid #1a2235", whiteSpace: "nowrap" },
+    td: { padding: "9px 8px", fontSize: "11px", borderBottom: "1px solid #0f1e30", verticalAlign: "middle" },
+    badge: (s) => ({ background: s === "YES" ? "rgba(74,222,128,0.1)" : "rgba(248,113,113,0.1)", color: s === "YES" ? "#4ade80" : "#f87171", border: `1px solid ${s === "YES" ? "#4ade80" : "#f87171"}`, borderRadius: "3px", padding: "2px 6px", fontSize: "9px", letterSpacing: "1px" }),
+    sBar: { display: "flex", height: "4px", borderRadius: "2px", overflow: "hidden", width: "60px", marginTop: "3px" },
+    errBox: { background: "rgba(248,113,113,0.06)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: "6px", padding: "16px", color: "#f87171", fontSize: "12px", lineHeight: "1.7" },
+    overlay: { position: "fixed", inset: 0, background: "rgba(8,11,18,0.92)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: "16px" },
+    modal: { background: "#0d1826", border: "1px solid #1a2235", borderRadius: "8px", padding: "20px", maxWidth: "520px", width: "100%", maxHeight: "85vh", overflowY: "auto" },
+  };
+
+  return (
+    <div style={S.root}>
+      <div style={S.hdr}>
+        <div><span style={S.logo}>⬡ SMART MONEY</span><span style={S.sub}>TOP 100 · LIVE</span></div>
+        <button style={S.btn} disabled={running} onClick={run}>
+          {running ? "● SCANNING" : phase === "done" ? "↺ REFRESH" : "▶ RUN SCAN"}
+        </button>
+      </div>
+
+      <div style={S.body}>
+        {phase === "idle" && (
+          <div style={{ textAlign: "center", padding: "60px 20px", color: "#2a3a50" }}>
+            <div style={{ fontSize: "52px", marginBottom: "14px", opacity: 0.2 }}>⬡</div>
+            <div style={{ fontSize: "11px", letterSpacing: "3px", marginBottom: "8px" }}>POLYMARKET SMART MONEY SCANNER</div>
+            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>Real positions · Top 100 traders · Live data</div>
+          </div>
+        )}
+
+        {running && (
+          <div style={S.progBox}>
+            <div style={{ fontSize: "11px", letterSpacing: "1px", color: "#4ade80" }}>{log} <span style={{ color: "#2a3a50" }}>{dots}</span></div>
+            <div style={S.bar}><div style={{ height: "100%", background: "linear-gradient(90deg,#4ade80,#22d3ee)", width: prog + "%", transition: "width 0.5s ease", borderRadius: "2px" }} /></div>
+            <div style={{ fontSize: "9px", color: "#2a3a50", marginTop: "5px", display: "flex", justifyContent: "space-between" }}>
+              <span>{prog < 10 ? "Cold start: up to 60s…" : ""}</span><span>{prog}%</span>
+            </div>
+          </div>
+        )}
+
+        {phase === "error" && (
+          <div style={S.errBox}>
+            <div style={{ fontWeight: "700", marginBottom: "6px" }}>⚠ SCAN FAILED</div>
+            <div>{err}</div>
+          </div>
+        )}
+
+        {phase === "done" && result && (
+          <>
+            <div style={S.statsRow}>
+              <div style={S.card()}><div style={S.lbl}>Traders</div><div style={S.val}>{result.traders}</div></div>
+              <div style={S.card()}><div style={S.lbl}>Markets</div><div style={S.val}>{markets.length}</div></div>
+            </div>
+            <div style={S.statsRow3}>
+              <div style={S.card(top?.recommendation === "YES" ? "rgba(74,222,128,0.25)" : "rgba(248,113,113,0.25)")}>
+                <div style={S.lbl}>Top Conviction Play</div>
+                <div style={{ fontSize: "12px", color: top?.recommendation === "YES" ? "#4ade80" : "#f87171", marginTop: "6px", lineHeight: "1.4", fontWeight: "700" }}>
+                  {top?.title?.slice(0, 56)}{top?.title?.length > 56 ? "…" : ""}
+                  <span style={{ fontSize: "10px", marginLeft: "6px", opacity: 0.7 }}>{top?.recommendation} @ {top?.curPrice ? fmtC(top.curPrice) : "?"}</span>
+                </div>
+              </div>
+            </div>
+
+            <div style={S.tabRow}>
+              {[["brief","Brief"],["markets","Markets"],["top10","Top 10"]].map(([id,lbl]) => (
+                <button key={id} style={S.tab(tab===id)} onClick={() => setTab(id)}>{lbl}</button>
+              ))}
+            </div>
+
+            {tab === "brief" && <div style={S.panel}>{brief || "—"}</div>}
+
+            {tab === "markets" && (
+              <div style={{ overflowX: "auto", margin: "0 -16px", padding: "0 16px" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>{["#","Market","Sig","Price","T","Y%","Conv"].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                  <tbody>
+                    {markets.map((m,i) => (
+                      <tr key={i} onClick={() => setSel(m)} style={{ cursor: "pointer" }}>
+                        <td style={{ ...S.td, color: "#2a3a50", fontSize: "10px" }}>{i+1}</td>
+                        <td style={{ ...S.td, maxWidth: "200px" }}>
+                          <div style={{ fontSize: "11px", color: "#c8d6e5", lineHeight: "1.3" }}>{m.title}</div>
+                        </td>
+                        <td style={S.td}><span style={S.badge(m.recommendation)}>{m.recommendation}</span></td>
+                        <td style={{ ...S.td, color: "#c8d6e5" }}>{m.curPrice ? fmtC(m.curPrice) : "—"}</td>
+                        <td style={{ ...S.td, color: "#9db8d4" }}>{m.totalTraders}</td>
+                        <td style={S.td}>
+                          <div style={{ fontSize: "10px", color: m.yesPct >= 50 ? "#4ade80" : "#f87171" }}>{m.yesPct}%</div>
+                          <div style={S.sBar}>
+                            <div style={{ width: m.yesPct+"%", background: "#4ade80" }}/>
+                            <div style={{ width: (100-m.yesPct)+"%", background: "#f87171" }}/>
+                          </div>
+                        </td>
+                        <td style={{ ...S.td, color: "#22d3ee", fontWeight: "700" }}>{m.conviction}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {tab === "top10" && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "10px" }}>
+                {markets.slice(0,10).map((m,i) => (
+                  <div key={i} onClick={() => setSel(m)} style={{ ...S.card(m.recommendation==="YES"?"rgba(74,222,128,0.18)":"rgba(248,113,113,0.18)"), cursor: "pointer" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "10px" }}>
+                      <span style={{ fontSize: "9px", color: "#2a3a50" }}>#{i+1}</span>
+                      <span style={S.badge(m.recommendation)}>{m.recommendation}</span>
+                    </div>
+                    <div style={{ fontSize: "12px", color: "#c8d6e5", lineHeight: "1.4", marginBottom: "12px" }}>{m.title}</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px", marginBottom: "10px" }}>
+                      {[["Price",m.curPrice?fmtC(m.curPrice):"—"],["Traders",m.totalTraders],["Score",m.conviction]].map(([l,v]) => (
+                        <div key={l}>
+                          <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px" }}>{l}</div>
+                          <div style={{ fontSize: "13px", color: "#c8d6e5", fontWeight: "700" }}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={S.sBar}>
+                      <div style={{ width: m.yesPct+"%", background: "#4ade80" }}/>
+                      <div style={{ width: (100-m.yesPct)+"%", background: "#f87171" }}/>
+                    </div>
+                    <div style={{ fontSize: "9px", color: "#2a3a50", marginTop: "4px" }}>YES {m.yesPct}% · NO {100-m.yesPct}%</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {sel && (
+        <div style={S.overlay} onClick={() => setSel(null)}>
+          <div style={S.modal} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "14px" }}>
+              <span style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" }}>Market Detail</span>
+              <button style={{ background: "none", border: "none", color: "#2a3a50", cursor: "pointer", fontSize: "16px" }} onClick={() => setSel(null)}>✕</button>
+            </div>
+            <div style={{ fontSize: "14px", color: "#c8d6e5", lineHeight: "1.5", marginBottom: "16px" }}>{sel.title}</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "14px" }}>
+              {[
+                { l:"Signal", v:sel.recommendation, c:sel.recommendation==="YES"?"#4ade80":"#f87171" },
+                { l:"Price",  v:sel.curPrice?fmtC(sel.curPrice):"—" },
+                { l:"Conv",   v:sel.conviction },
+                { l:"Traders",v:sel.totalTraders },
+                { l:"YES",    v:sel.yesT },
+                { l:"NO",     v:sel.noT },
+              ].map(({l,v,c}) => (
+                <div key={l} style={{ background: "#0a1020", borderRadius: "4px", padding: "10px" }}>
+                  <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px", marginBottom: "3px" }}>{l}</div>
+                  <div style={{ fontSize: "14px", color: c||"#c8d6e5", fontWeight: "700" }}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={S.sBar}>
+              <div style={{ width: sel.yesPct+"%", background: "#4ade80" }}/>
+              <div style={{ width: (100-sel.yesPct)+"%", background: "#f87171" }}/>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "9px", color: "#2a3a50", marginTop: "4px", marginBottom: "14px" }}>
+              <span>YES {sel.yesPct}%</span><span>NO {100-sel.yesPct}%</span>
+            </div>
+            {sel.details?.length > 0 && (
+              <>
+                <div style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase", marginBottom: "8px" }}>Top Trader Positions</div>
+                {sel.details.slice(0,8).map((t,i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #0f1e30", fontSize: "11px" }}>
+                    <span style={{ color: "#2a3a50" }}>Rank #{t.rank}</span>
+                    <span style={{ color: t.outcome?.toUpperCase()==="YES"?"#4ade80":"#f87171" }}>{t.outcome?.toUpperCase()}</span>
+                    <span style={{ color: "#c8d6e5" }}>{fmt(t.size)}</span>
+                  </div>
+                ))}
+              </>
+            )}
+            {sel.endDate && <div style={{ fontSize: "10px", color: "#2a3a50", marginTop: "12px" }}>Resolves: {sel.endDate.split("T")[0]}</div>}
+            {(sel.eventSlug||sel.slug) && (
+              <a href={`https://polymarket.com/event/${sel.eventSlug||sel.slug}`} target="_blank" rel="noopener noreferrer" style={{ display: "inline-block", marginTop: "10px", fontSize: "10px", color: "#22d3ee", textDecoration: "none", letterSpacing: "1px" }}>VIEW ON POLYMARKET →</a>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+</body>
+</html>
