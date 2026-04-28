@@ -93,8 +93,14 @@ function App() {
       setDots("");
 
       tick("Fetching leaderboard…", 10);
-      const raw = await pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=100");
-      const traders = Array.isArray(raw) ? raw : (raw.leaderboard || raw.data || []);
+    const [page1, page2] = await Promise.all([
+  pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=0"),
+  pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=50"),
+]);
+const arr1 = Array.isArray(page1) ? page1 : (page1.leaderboard || page1.data || []);
+const arr2 = Array.isArray(page2) ? page2 : (page2.leaderboard || page2.data || []);
+const traders = [...arr1, ...arr2];
+
       if (!traders.length) throw new Error("Leaderboard returned no traders.");
 
       tick(`${traders.length} traders loaded — fetching positions…`, 18);
