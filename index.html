@@ -60,6 +60,22 @@ const pmFetch = async (url) => {
   return res.json();
 };
 
+// NEW: Fetch live market data from gamma API
+const fetchMarketLive = async (slug, conditionId) => {
+  try {
+    if (slug) {
+      const data = await pmFetch(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}`);
+      if (Array.isArray(data) && data.length > 0) return data[0];
+      if (data?.markets?.[0]) return data.markets[0];
+    }
+    if (conditionId) {
+      const data = await pmFetch(`https://gamma-api.polymarket.com/markets?condition_ids=${conditionId}`);
+      if (Array.isArray(data) && data.length > 0) return data[0];
+    }
+  } catch {}
+  return null;
+};
+
 const aiCall = async (msg, maxTokens = 1500) => {
   const res = await fetch("/ai", {
     method: "POST",
@@ -74,6 +90,7 @@ const aiCall = async (msg, maxTokens = 1500) => {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmtC = (n) => n != null ? (Number(n) * 100).toFixed(0) + "¢" : "—";
 const fmt = (n) => n != null ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 }) : "—";
+
 const fmtRel = (ts) => {
   if (!ts) return "never";
   const s = (Date.now() - ts) / 1000;
@@ -82,13 +99,21 @@ const fmtRel = (ts) => {
   if (s < 86400) return Math.floor(s/3600) + "h ago";
   return Math.floor(s/86400) + "d ago";
 };
+
+const fmtTime = (ts) => {
+  if (!ts) return "—";
+  return new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+};
+
+const fmtToday = () => new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+
 const daysUntil = (dateStr) => dateStr ? Math.round((new Date(dateStr) - Date.now()) / 86400000) : null;
 
-// Detect "noise" markets: long-shot multi-outcome questions where smart money 
-// betting NO shows up as 100% YES sentiment (because we're aggregating contrarian bets).
-// Rules:
-//  - If 100% sentiment AND no current price (resolved/extreme) AND market is a "Will X happen?" long shot
-//  - Or: market title matches multi-outcome election/MVP/championship pattern with >5 sibling markets
+const hoursUntil = (dateStr) => {
+  if (!dateStr) return null;
+  return (new Date(dateStr) - Date.now()) / 3600000;
+};
+
 const NOISE_PATTERNS = [
   /will trump nominate .+ as the next fed chair/i,
   /will .+ win the 20\d\d-20\d\d nba mvp/i,
@@ -97,15 +122,14 @@ const NOISE_PATTERNS = [
   /will .+ win the 20\d\d fifa world cup/i,
   /will .+ win the 20\d\d-20\d\d english premier league/i,
 ];
+
 const isNoise = (m) => {
-  // No price + 100% sentiment = stale/long-shot market everyone is just betting NO on
   if (!m.curPrice && (m.dominancePct === 100 || m.yesPct === 100 || m.yesPct === 0)) return true;
-  // Pattern match for multi-outcome long-shots
-  if (NOISE_PATTERNS.some(p => p.test(m.title))) {
-    if (m.dominancePct >= 95) return true;
-  }
-  // 100¢ price = already resolved
+  if (NOISE_PATTERNS.some(p => p.test(m.title)) && m.dominancePct >= 95) return true;
   if (m.curPrice && m.curPrice >= 0.99) return true;
+  // Hide markets resolving in less than 1 hour (stale)
+  const hrs = hoursUntil(m.endDate);
+  if (hrs != null && hrs < 1) return true;
   return false;
 };
 
@@ -122,8 +146,15 @@ function App() {
   const [err, setErr] = useState(null);
   const [filters, setFilters] = useState({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false, hideNoise: true });
   const [filtersOpen, setFiltersOpen] = useState(false);
-  const [askAI, setAskAI] = useState({ loading: false, advice: "", market: null });
+  const [askAI, setAskAI] = useState({ loading: false, advice: "", market: null, livePrice: null });
   const [bankroll, setBankroll] = useState(120);
+  const [now, setNow] = useState(Date.now());
+
+  // Update "now" every minute for live timestamps
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const store = loadStore();
@@ -262,8 +293,9 @@ function App() {
       }));
 
       try {
+        const today = fmtToday();
         const briefText = await aiCall(
-`You are a sharp Polymarket investment analyst. Real top-100 trader data, noise-filtered. avgEntry = where smart money got in.
+`Today is ${today}. You are a sharp Polymarket investment analyst. Real top-100 trader data, noise-filtered. avgEntry = where smart money got in.
 
 ${JSON.stringify(summary, null, 2)}
 
@@ -294,53 +326,89 @@ EDGE:
     }
   }, [previousScan, bankroll]);
 
-  // Per-market AI advice
+  // Per-market AI advice — now fetches live price first
   const askAboutMarket = useCallback(async (m) => {
-    setAskAI({ loading: true, advice: "", market: m });
+    setAskAI({ loading: true, advice: "", market: m, livePrice: null });
     try {
+      // Step 1: Fetch live market data
+      const liveData = await fetchMarketLive(m.slug, m.conditionId);
+      let livePrice = m.curPrice;
+      let liveYesPrice = null;
+      let liveNoPrice = null;
+      let outcomes = null;
+
+      if (liveData) {
+        // gamma API returns outcomePrices as array
+        try {
+          const op = typeof liveData.outcomePrices === "string" ? JSON.parse(liveData.outcomePrices) : liveData.outcomePrices;
+          if (Array.isArray(op) && op.length >= 2) {
+            liveYesPrice = parseFloat(op[0]);
+            liveNoPrice = parseFloat(op[1]);
+            // For our market signal direction, use the matching outcome
+            livePrice = m.recommendation === "YES" ? liveYesPrice : liveNoPrice;
+          }
+          const oc = typeof liveData.outcomes === "string" ? JSON.parse(liveData.outcomes) : liveData.outcomes;
+          if (Array.isArray(oc)) outcomes = oc;
+        } catch {}
+      }
+
       const ctx = {
         title: m.title,
-        currentPrice: m.curPrice ? fmtC(m.curPrice) : "unknown",
+        currentDate: fmtToday(),
+        currentTimestamp: new Date().toISOString(),
+        livePriceForSignal: livePrice ? fmtC(livePrice) : "unknown",
+        liveYesPrice: liveYesPrice ? fmtC(liveYesPrice) : "unknown",
+        liveNoPrice: liveNoPrice ? fmtC(liveNoPrice) : "unknown",
+        outcomes,
         smartMoneySignal: m.recommendation,
         sentiment: m.dominancePct + "%",
         traders: m.totalTraders,
         avgEntry: m.avgEntry ? fmtC(m.avgEntry) : "unknown",
-        priceVsEntry: m.avgEntry && m.curPrice ? Math.round((m.curPrice - m.avgEntry) * 100) + "¢" : "unknown",
-        endDate: m.endDate?.split("T")[0] || "unknown",
+        priceVsEntry: m.avgEntry && livePrice ? Math.round((livePrice - m.avgEntry) * 100) + "¢" : "unknown",
+        endDate: m.endDate || "unknown",
         daysToResolve: daysUntil(m.endDate),
+        hoursToResolve: hoursUntil(m.endDate)?.toFixed(1),
         topTraders: m.details?.slice(0, 5),
         bankroll,
       };
-      const advice = await aiCall(
-`You are a sharp Polymarket trading advisor. The user is asking about a specific market and wants direct, actionable advice.
 
-MARKET DATA:
+      setAskAI(prev => ({ ...prev, livePrice }));
+
+      const advice = await aiCall(
+`Today is ${fmtToday()}. You are a sharp Polymarket trading advisor giving direct, actionable advice.
+
+MARKET DATA (LIVE):
 ${JSON.stringify(ctx, null, 2)}
+
+Note: livePriceForSignal is the current live price for the BUY side that smart money is on. liveYesPrice/liveNoPrice are the current YES/NO prices.
 
 Give your recommendation in this EXACT format (plain text, no markdown):
 
 VERDICT: [BET | SKIP | WATCH]
 
 WHY:
-[2-3 sentences explaining the actual edge or lack thereof. Be specific about the asymmetry, smart money behavior, and any red flags.]
+[2-3 sentences on the actual edge or lack thereof. Be specific about asymmetry, smart money behavior, time-to-resolve, and any red flags. If the market resolves in <24 hours, factor in that variance dominates.]
 
 IF BETTING:
 Side: [YES or NO]
-Price target: [acceptable price range to enter]
-Size: $[suggested amount based on bankroll]
-Expected payout: $[amount if you win]
-Hold time: [how long until resolution]
+Entry price: [acceptable price range to enter]
+Size: $[suggested amount based on $${bankroll} bankroll - usually 5-25% of bankroll for single position]
+Expected payout: $[total payout if you win, including original]
+Hold time: [time until resolution]
 
 RISKS:
 - [Specific risk 1]
 - [Specific risk 2]
 
-Be honest. If it's not worth betting, say SKIP and explain why. Don't manufacture edge that isn't there.`,
+If livePriceForSignal is "unknown" or market resolves in <1 hour, recommend SKIP — no edge can be evaluated.
+If livePriceForSignal > 90¢, SKIP — terrible asymmetry.
+If only 2-3 traders agree, SKIP — that's noise, not signal.
+Be honest. Don't manufacture edge.`,
         1000
       );
-      setAskAI({ loading: false, advice, market: m });
+      setAskAI({ loading: false, advice, market: m, livePrice });
     } catch (e) {
-      setAskAI({ loading: false, advice: "Failed to get advice: " + e.message, market: m });
+      setAskAI({ loading: false, advice: "Failed to get advice: " + e.message, market: m, livePrice: null });
     }
   }, [bankroll]);
 
@@ -356,15 +424,17 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
       if (filters.freshOnly && !m.isNew && !((m.tradersDelta || 0) > 0)) return false;
       return true;
     });
-  }, [result, filters]);
+  }, [result, filters, now]);
 
   const allCleanMarkets = useMemo(() => {
     if (!result) return [];
     return filters.hideNoise ? result.markets.filter(m => !m.noise) : result.markets;
-  }, [result, filters.hideNoise]);
+  }, [result, filters.hideNoise, now]);
 
   const running = phase === "running";
   const top = filteredMarkets[0] || allCleanMarkets[0];
+  const scanAge = result?.timestamp ? (now - result.timestamp) / 60000 : null;
+  const isStale = scanAge != null && scanAge > 30;
 
   const S = {
     root: { fontFamily: "'DM Mono','Courier New',monospace", background: "#080b12", color: "#c8d6e5", minHeight: "100vh" },
@@ -393,6 +463,7 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
     askBtn: { width: "100%", background: "linear-gradient(135deg,#22d3ee,#0ea5e9)", color: "#060a0f", border: "none", borderRadius: "6px", padding: "12px", fontSize: "11px", letterSpacing: "2px", textTransform: "uppercase", cursor: "pointer", fontFamily: "'DM Mono',monospace", fontWeight: "700", marginBottom: "14px" },
     filterPanel: { background: "#0a1020", border: "1px solid #1a2235", borderRadius: "6px", padding: "14px", marginBottom: "12px" },
     filterRow: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px", gap: "10px" },
+    dateBar: { background: "#08111f", borderBottom: "1px solid #1a2235", padding: "6px 18px", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "9px", color: "#3b5270", letterSpacing: "1px" },
   };
 
   const Row = ({ m, i }) => (
@@ -428,12 +499,22 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
         </button>
       </div>
 
+      {/* Date/timestamp bar */}
+      <div style={S.dateBar}>
+        <span>{fmtToday().toUpperCase()}</span>
+        {result?.timestamp && (
+          <span style={{ color: isStale ? "#f87171" : "#3b5270" }}>
+            {isStale && "⚠ "}LAST SCAN · {fmtTime(result.timestamp)} · {fmtRel(result.timestamp)}
+          </span>
+        )}
+      </div>
+
       <div style={S.body}>
         {phase === "idle" && !result && (
           <div style={{ textAlign: "center", padding: "60px 20px", color: "#2a3a50" }}>
             <div style={{ fontSize: "52px", marginBottom: "14px", opacity: 0.2 }}>⬡</div>
             <div style={{ fontSize: "11px", letterSpacing: "3px", marginBottom: "8px" }}>POLYMARKET SMART MONEY SCANNER</div>
-            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>Noise filtered · ROI weighted · Per-market AI advice</div>
+            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>Live prices · Noise filtered · Per-market AI advice</div>
           </div>
         )}
 
@@ -456,6 +537,12 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
 
         {result && (
           <>
+            {isStale && (
+              <div style={{ background: "rgba(248,113,113,0.06)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: "6px", padding: "10px 14px", marginBottom: "12px", fontSize: "10px", color: "#f87171" }}>
+                ⚠ Data is {Math.round(scanAge)} min old. Prices on Polymarket move constantly — hit REFRESH for current data.
+              </div>
+            )}
+
             <div style={S.statsRow}>
               <div style={S.card()}>
                 <div style={S.lbl}>Filtered Picks</div>
@@ -472,7 +559,7 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "8px", marginBottom: "14px" }}>
               <div style={S.card(top?.recommendation === "YES" ? "rgba(74,222,128,0.25)" : top ? "rgba(248,113,113,0.25)" : "")}>
-                <div style={S.lbl}>Top Filtered Pick · {fmtRel(result.timestamp)}</div>
+                <div style={S.lbl}>Top Filtered Pick</div>
                 <div style={{ fontSize: "12px", color: top?.recommendation === "YES" ? "#4ade80" : "#f87171", marginTop: "6px", lineHeight: "1.4", fontWeight: "700" }}>
                   {top?.title?.slice(0, 56) || "—"}{top?.title?.length > 56 ? "…" : ""}
                   {top && <span style={{ fontSize: "10px", marginLeft: "6px", opacity: 0.7 }}>{top.recommendation} @ {top.curPrice ? fmtC(top.curPrice) : "?"}</span>}
@@ -507,7 +594,7 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
                     <input type="number" min="1" max="365" value={filters.maxDays} onChange={e => setFilters({ ...filters, maxDays: +e.target.value })}/>
                   </div>
                   <div style={S.filterRow}>
-                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Hide noise (long-shots, resolved)</div>
+                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Hide noise</div>
                     <button onClick={() => setFilters({ ...filters, hideNoise: !filters.hideNoise })}
                       style={{ background: filters.hideNoise ? "#4ade80" : "#101c2c", color: filters.hideNoise ? "#060a0f" : "#9db8d4", border: "none", borderRadius: "4px", padding: "5px 12px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
                       {filters.hideNoise ? "ON" : "OFF"}
@@ -565,13 +652,12 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
         )}
       </div>
 
-      {/* Detail modal */}
       {sel && (
-        <div style={S.overlay} onClick={() => { setSel(null); setAskAI({ loading: false, advice: "", market: null }); }}>
+        <div style={S.overlay} onClick={() => { setSel(null); setAskAI({ loading: false, advice: "", market: null, livePrice: null }); }}>
           <div style={S.modal} onClick={e => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "14px" }}>
-              <span style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" }}>Market Detail</span>
-              <button style={{ background: "none", border: "none", color: "#2a3a50", cursor: "pointer", fontSize: "16px" }} onClick={() => { setSel(null); setAskAI({ loading: false, advice: "", market: null }); }}>✕</button>
+              <span style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" }}>Market Detail · {fmtTime(Date.now())}</span>
+              <button style={{ background: "none", border: "none", color: "#2a3a50", cursor: "pointer", fontSize: "16px" }} onClick={() => { setSel(null); setAskAI({ loading: false, advice: "", market: null, livePrice: null }); }}>✕</button>
             </div>
             <div style={{ fontSize: "14px", color: "#c8d6e5", lineHeight: "1.5", marginBottom: "16px" }}>
               {sel.title}
@@ -579,14 +665,17 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
               {sel.tradersDelta > 0 && <span style={S.newBadge}>+{sel.tradersDelta} TRADERS</span>}
             </div>
 
-            {/* Ask AI button */}
             <button style={S.askBtn} onClick={() => askAboutMarket(sel)} disabled={askAI.loading && askAI.market?.conditionId === sel.conditionId}>
-              {askAI.loading && askAI.market?.conditionId === sel.conditionId ? <span className="pulse">◇ ANALYZING...</span> : "💡 ASK AI: SHOULD I BET?"}
+              {askAI.loading && askAI.market?.conditionId === sel.conditionId ? <span className="pulse">◇ FETCHING LIVE PRICE & ANALYZING...</span> : "💡 ASK AI: SHOULD I BET?"}
             </button>
 
-            {/* AI advice display */}
             {askAI.advice && askAI.market?.conditionId === sel.conditionId && (
               <div style={{ background: "#0a1020", border: "1px solid #22d3ee", borderRadius: "6px", padding: "14px", marginBottom: "14px", whiteSpace: "pre-wrap", fontSize: "11px", lineHeight: "1.7", color: "#c8d6e5" }}>
+                {askAI.livePrice && (
+                  <div style={{ fontSize: "9px", color: "#22d3ee", letterSpacing: "1px", marginBottom: "8px", paddingBottom: "8px", borderBottom: "1px solid #1a2235" }}>
+                    LIVE PRICE: {fmtC(askAI.livePrice)} · FETCHED {fmtTime(Date.now())}
+                  </div>
+                )}
                 {askAI.advice}
               </div>
             )}
@@ -594,7 +683,7 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "14px" }}>
               {[
                 { l:"Signal", v:sel.recommendation, c:sel.recommendation==="YES"?"#4ade80":"#f87171" },
-                { l:"Price", v:sel.curPrice?fmtC(sel.curPrice):"—" },
+                { l:"Scan price", v:sel.curPrice?fmtC(sel.curPrice):"—" },
                 { l:"Avg entry", v:sel.avgEntry?fmtC(sel.avgEntry):"—", c: "#fbbf24" },
                 { l:"Traders", v:sel.totalTraders },
                 { l:"YES", v:sel.yesT },
@@ -609,7 +698,7 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
 
             {sel.avgEntry && sel.curPrice && (
               <div style={{ background: "#0a1020", borderRadius: "4px", padding: "10px", marginBottom: "14px" }}>
-                <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px", marginBottom: "3px" }}>Price vs smart-money entry</div>
+                <div style={{ fontSize: "8px", color: "#2a3a50", letterSpacing: "1px", marginBottom: "3px" }}>Scan price vs smart-money entry</div>
                 <div style={{ fontSize: "12px", color: sel.curPrice > sel.avgEntry ? "#f87171" : "#4ade80", fontWeight: "700" }}>
                   {sel.curPrice > sel.avgEntry ? "↑" : "↓"} {Math.abs(Math.round((sel.curPrice - sel.avgEntry) * 100))}¢ {sel.curPrice > sel.avgEntry ? "ABOVE" : "BELOW"} entry
                   <span style={{ fontSize: "10px", color: "#2a3a50", marginLeft: "6px", fontWeight: "400" }}>
@@ -641,7 +730,11 @@ Be honest. If it's not worth betting, say SKIP and explain why. Don't manufactur
                 ))}
               </>
             )}
-            {sel.endDate && <div style={{ fontSize: "10px", color: "#2a3a50", marginTop: "12px" }}>Resolves: {sel.endDate.split("T")[0]} ({daysUntil(sel.endDate)}d)</div>}
+            {sel.endDate && (
+              <div style={{ fontSize: "10px", color: "#2a3a50", marginTop: "12px" }}>
+                Resolves: {sel.endDate.split("T")[0]} ({daysUntil(sel.endDate)}d, {hoursUntil(sel.endDate)?.toFixed(1)}h)
+              </div>
+            )}
             {(sel.eventSlug||sel.slug) && (
               <a href={`https://polymarket.com/event/${sel.eventSlug||sel.slug}`} target="_blank" rel="noopener noreferrer" style={{ display: "inline-block", marginTop: "10px", fontSize: "10px", color: "#22d3ee", textDecoration: "none", letterSpacing: "1px" }}>VIEW ON POLYMARKET →</a>
             )}
