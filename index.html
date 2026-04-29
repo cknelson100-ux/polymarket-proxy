@@ -19,9 +19,9 @@ body { font-family: 'DM Mono', 'Courier New', monospace; color: #c8d6e5; min-hei
 ::-webkit-scrollbar-thumb { background: #1a2235; border-radius: 2px; }
 tbody tr:hover td { background: rgba(74,222,128,0.025) !important; }
 button:active { opacity: 0.7; }
-input[type=range] { -webkit-appearance: none; height: 3px; background: #1a2235; border-radius: 2px; outline: none; }
-input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #4ade80; border-radius: 50%; cursor: pointer; }
 input[type=number] { background: #0a1020; border: 1px solid #1a2235; color: #c8d6e5; padding: 6px 8px; border-radius: 4px; font-family: inherit; font-size: 12px; width: 60px; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.pulse { animation: pulse 1.5s ease-in-out infinite; }
 </style>
 </head>
 <body>
@@ -34,15 +34,13 @@ input[type=number] { background: #0a1020; border: 1px solid #1a2235; color: #c8d
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useCallback } = React;
 
-// ── STORAGE ───────────────────────────────────────────────────────────────
 const STORAGE_KEY = "polymarket_dashboard_v1";
 const loadStore = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch { return {}; } };
 const saveStore = (data) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {} };
 
-// ── API ───────────────────────────────────────────────────────────────────
 const wakeProxy = async (onDot) => {
   const start = Date.now();
-  while (Date.now() - start < 500000) {
+  while (Date.now() - start < 180000) {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 12000);
@@ -53,7 +51,7 @@ const wakeProxy = async (onDot) => {
     onDot();
     await new Promise(r => setTimeout(r, 4000));
   }
-  throw new Error("Proxy did not wake up.");
+  throw new Error("Proxy did not wake up after 3 minutes.");
 };
 
 const pmFetch = async (url) => {
@@ -62,18 +60,17 @@ const pmFetch = async (url) => {
   return res.json();
 };
 
-const aiCall = async (msg) => {
+const aiCall = async (msg, maxTokens = 1500) => {
   const res = await fetch("/ai", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1500, messages: [{ role: "user", content: msg }] }),
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: msg }] }),
   });
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || `AI ${res.status}`); }
   const d = await res.json();
   return d.content?.find(b => b.type === "text")?.text || "";
 };
 
-// ── HELPERS ───────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmtC = (n) => n != null ? (Number(n) * 100).toFixed(0) + "¢" : "—";
 const fmt = (n) => n != null ? Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 }) : "—";
@@ -85,12 +82,33 @@ const fmtRel = (ts) => {
   if (s < 86400) return Math.floor(s/3600) + "h ago";
   return Math.floor(s/86400) + "d ago";
 };
-const daysUntil = (dateStr) => {
-  if (!dateStr) return null;
-  return Math.round((new Date(dateStr) - Date.now()) / 86400000);
+const daysUntil = (dateStr) => dateStr ? Math.round((new Date(dateStr) - Date.now()) / 86400000) : null;
+
+// Detect "noise" markets: long-shot multi-outcome questions where smart money 
+// betting NO shows up as 100% YES sentiment (because we're aggregating contrarian bets).
+// Rules:
+//  - If 100% sentiment AND no current price (resolved/extreme) AND market is a "Will X happen?" long shot
+//  - Or: market title matches multi-outcome election/MVP/championship pattern with >5 sibling markets
+const NOISE_PATTERNS = [
+  /will trump nominate .+ as the next fed chair/i,
+  /will .+ win the 20\d\d-20\d\d nba mvp/i,
+  /will .+ win the 20\d\d-20\d\d nba finals/i,
+  /will .+ win the 20\d\d-?20?\d\d nhl stanley cup/i,
+  /will .+ win the 20\d\d fifa world cup/i,
+  /will .+ win the 20\d\d-20\d\d english premier league/i,
+];
+const isNoise = (m) => {
+  // No price + 100% sentiment = stale/long-shot market everyone is just betting NO on
+  if (!m.curPrice && (m.dominancePct === 100 || m.yesPct === 100 || m.yesPct === 0)) return true;
+  // Pattern match for multi-outcome long-shots
+  if (NOISE_PATTERNS.some(p => p.test(m.title))) {
+    if (m.dominancePct >= 95) return true;
+  }
+  // 100¢ price = already resolved
+  if (m.curPrice && m.curPrice >= 0.99) return true;
+  return false;
 };
 
-// ── APP ───────────────────────────────────────────────────────────────────
 function App() {
   const [phase, setPhase] = useState("idle");
   const [prog, setProg] = useState(0);
@@ -102,18 +120,22 @@ function App() {
   const [tab, setTab] = useState("filtered");
   const [sel, setSel] = useState(null);
   const [err, setErr] = useState(null);
-  const [filters, setFilters] = useState({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false });
+  const [filters, setFilters] = useState({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false, hideNoise: true });
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [askAI, setAskAI] = useState({ loading: false, advice: "", market: null });
+  const [bankroll, setBankroll] = useState(120);
 
-  // Load previous scan + last results on mount
   useEffect(() => {
     const store = loadStore();
-    if (store.lastResult) {
-      setResult(store.lastResult);
-      setBrief(store.lastBrief || "");
-    }
+    if (store.lastResult) { setResult(store.lastResult); setBrief(store.lastBrief || ""); }
     if (store.previousScan) setPreviousScan(store.previousScan);
+    if (store.bankroll) setBankroll(store.bankroll);
   }, []);
+
+  useEffect(() => {
+    const store = loadStore();
+    saveStore({ ...store, bankroll });
+  }, [bankroll]);
 
   const tick = (msg, pct) => { setLog(msg); if (pct != null) setProg(pct); };
 
@@ -125,7 +147,6 @@ function App() {
       await wakeProxy(() => { ds += "·"; setDots(ds); });
       setDots("");
 
-      // ── 1. LEADERBOARD (paginated) ──────────────────────────────────────
       tick("Fetching leaderboard…", 8);
       const [p1, p2] = await Promise.all([
         pmFetch("https://data-api.polymarket.com/v1/leaderboard?window=all&limit=50&offset=0"),
@@ -139,7 +160,6 @@ function App() {
       tick(`${traders.length} traders loaded — fetching positions…`, 18);
       await sleep(150);
 
-      // ── 2. POSITIONS ────────────────────────────────────────────────────
       const posMap = {};
       const top = traders.slice(0, 100);
       const BATCH = 8;
@@ -158,7 +178,6 @@ function App() {
           catch { return; }
           if (!Array.isArray(positions)) return;
 
-          // ROI-weighted trader weight
           const vol = Number(trader.vol) || 0;
           const pnl = Number(trader.pnl) || 0;
           const roi = vol > 0 ? pnl / vol : 0;
@@ -189,7 +208,6 @@ function App() {
         await sleep(60);
       }
 
-      // ── 3. AGGREGATE + COMPARE WITH PREVIOUS ────────────────────────────
       tick("Aggregating…", 78);
       const prevMap = previousScan?.markets || {};
 
@@ -205,15 +223,16 @@ function App() {
           const key = m.conditionId || m.slug;
           const prev = prevMap[key];
           const tradersDelta = prev ? m.total - (prev.total || 0) : null;
-          const priceDelta = (prev && prev.curPrice && m.curPrice) ? m.curPrice - prev.curPrice : null;
           const isNew = !prev;
-          return {
+          const out = {
             ...m,
             totalTraders: m.total, yesPct, recommendation: rec,
             dominancePct: rec === "YES" ? yesPct : 100 - yesPct,
             conviction: Math.round(m.conv * 10) / 10,
-            avgEntry, tradersDelta, priceDelta, isNew,
+            avgEntry, tradersDelta, isNew,
           };
+          out.noise = isNoise(out);
+          return out;
         });
 
       if (!markets.length) throw new Error("No overlapping positions found.");
@@ -221,24 +240,22 @@ function App() {
       const newResult = { traders: top.length, markets, timestamp: Date.now() };
       setResult(newResult);
 
-      // Persist: current → lastResult, current snapshot → previousScan for next time
       const snapshot = { timestamp: Date.now(), markets: Object.fromEntries(markets.map(m => [m.conditionId || m.slug, { total: m.total, curPrice: m.curPrice }])) };
-      saveStore({ lastResult: newResult, previousScan: snapshot, lastBrief: "" });
+      saveStore({ lastResult: newResult, previousScan: snapshot, lastBrief: "", bankroll });
       setPreviousScan(snapshot);
 
-      // ── 4. AI BRIEF ─────────────────────────────────────────────────────
-      tick("Generating investment brief…", 86);
-      const filtered = markets.filter(m => {
+      tick("Generating brief…", 86);
+      const cleaned = markets.filter(m => !m.noise);
+      const filtered = cleaned.filter(m => {
         const cents = (m.curPrice || 0) * 100;
         return cents >= 25 && cents <= 75 && m.totalTraders >= 5;
       }).slice(0, 10);
 
-      const summary = (filtered.length ? filtered : markets.slice(0, 10)).map(m => ({
+      const summary = (filtered.length ? filtered : cleaned.slice(0, 10)).map(m => ({
         title: m.title, traders: m.totalTraders, signal: m.recommendation,
-        sentiment: m.dominancePct + "% " + m.recommendation,
+        sentiment: m.dominancePct + "%",
         price: m.curPrice ? fmtC(m.curPrice) : "?",
         avgEntry: m.avgEntry ? fmtC(m.avgEntry) : "?",
-        priceVsEntry: m.avgEntry && m.curPrice ? Math.round((m.curPrice - m.avgEntry) * 100) + "¢" : "?",
         conviction: m.conviction,
         endDate: m.endDate?.split("T")[0] || "?",
         isNew: m.isNew, newTraders: m.tradersDelta,
@@ -246,22 +263,19 @@ function App() {
 
       try {
         const briefText = await aiCall(
-`You are a sharp Polymarket investment analyst. This is REAL live data from the top 100 traders, ALREADY filtered to actionable markets (price 25-75¢, 5+ traders). avgEntry = where smart money entered. priceVsEntry = how much price has moved since they entered (positive = late to the trade, negative = trading below their entry = potential discount).
+`You are a sharp Polymarket investment analyst. Real top-100 trader data, noise-filtered. avgEntry = where smart money got in.
 
 ${JSON.stringify(summary, null, 2)}
 
-Write a crisp investment brief in EXACTLY this plain-text format:
+User has $${bankroll} bankroll. Format EXACTLY:
 
 TOP PICKS:
-→ [Market] — [YES/NO] @ [price]. Smart money entered @ [avgEntry], so you'd be [getting in at discount/paying premium of X¢]. [Why this is a real opportunity in 1 sentence.] Risk: [one risk].
+→ [Market] — [YES/NO] @ [price]. Entry: [avgEntry] (you'd be [late/early] by [delta]¢). [Why this is real edge in 1 sentence.] Suggested size: $[X]. Risk: [one risk].
 → [Second pick]
 → [Third pick]
 
 FRESH:
-[Mention any markets where isNew=true or newTraders>0 — these are positions smart money is actively building right now]
-
-FADE:
-[1-2 sentences on anything overcrowded or where price has run too far past entry]
+[Markets where isNew=true or newTraders>0 — smart money actively building]
 
 EDGE:
 [1-2 sentences on overall pattern]`
@@ -278,12 +292,62 @@ EDGE:
     } catch (e) {
       setErr(e.message); setPhase("error");
     }
-  }, [previousScan]);
+  }, [previousScan, bankroll]);
 
-  // ── FILTERED MARKETS ────────────────────────────────────────────────────
+  // Per-market AI advice
+  const askAboutMarket = useCallback(async (m) => {
+    setAskAI({ loading: true, advice: "", market: m });
+    try {
+      const ctx = {
+        title: m.title,
+        currentPrice: m.curPrice ? fmtC(m.curPrice) : "unknown",
+        smartMoneySignal: m.recommendation,
+        sentiment: m.dominancePct + "%",
+        traders: m.totalTraders,
+        avgEntry: m.avgEntry ? fmtC(m.avgEntry) : "unknown",
+        priceVsEntry: m.avgEntry && m.curPrice ? Math.round((m.curPrice - m.avgEntry) * 100) + "¢" : "unknown",
+        endDate: m.endDate?.split("T")[0] || "unknown",
+        daysToResolve: daysUntil(m.endDate),
+        topTraders: m.details?.slice(0, 5),
+        bankroll,
+      };
+      const advice = await aiCall(
+`You are a sharp Polymarket trading advisor. The user is asking about a specific market and wants direct, actionable advice.
+
+MARKET DATA:
+${JSON.stringify(ctx, null, 2)}
+
+Give your recommendation in this EXACT format (plain text, no markdown):
+
+VERDICT: [BET | SKIP | WATCH]
+
+WHY:
+[2-3 sentences explaining the actual edge or lack thereof. Be specific about the asymmetry, smart money behavior, and any red flags.]
+
+IF BETTING:
+Side: [YES or NO]
+Price target: [acceptable price range to enter]
+Size: $[suggested amount based on bankroll]
+Expected payout: $[amount if you win]
+Hold time: [how long until resolution]
+
+RISKS:
+- [Specific risk 1]
+- [Specific risk 2]
+
+Be honest. If it's not worth betting, say SKIP and explain why. Don't manufacture edge that isn't there.`,
+        1000
+      );
+      setAskAI({ loading: false, advice, market: m });
+    } catch (e) {
+      setAskAI({ loading: false, advice: "Failed to get advice: " + e.message, market: m });
+    }
+  }, [bankroll]);
+
   const filteredMarkets = useMemo(() => {
     if (!result) return [];
     return result.markets.filter(m => {
+      if (filters.hideNoise && m.noise) return false;
       const cents = (m.curPrice || 0) * 100;
       if (cents < filters.minPrice || cents > filters.maxPrice) return false;
       if (m.totalTraders < filters.minTraders) return false;
@@ -294,9 +358,13 @@ EDGE:
     });
   }, [result, filters]);
 
+  const allCleanMarkets = useMemo(() => {
+    if (!result) return [];
+    return filters.hideNoise ? result.markets.filter(m => !m.noise) : result.markets;
+  }, [result, filters.hideNoise]);
+
   const running = phase === "running";
-  const markets = result?.markets || [];
-  const top = filteredMarkets[0] || markets[0];
+  const top = filteredMarkets[0] || allCleanMarkets[0];
 
   const S = {
     root: { fontFamily: "'DM Mono','Courier New',monospace", background: "#080b12", color: "#c8d6e5", minHeight: "100vh" },
@@ -308,7 +376,6 @@ EDGE:
     progBox: { margin: "16px 0", background: "#0d1826", border: "1px solid #1a2235", borderRadius: "6px", padding: "16px" },
     bar: { height: "3px", background: "#1a2235", borderRadius: "2px", marginTop: "10px", overflow: "hidden" },
     statsRow: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginBottom: "10px" },
-    statsRow3: { display: "grid", gridTemplateColumns: "1fr", gap: "8px", marginBottom: "14px" },
     card: (a) => ({ background: "#0d1826", border: `1px solid ${a || "#1a2235"}`, borderRadius: "6px", padding: "12px" }),
     lbl: { fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" },
     val: { fontSize: "20px", color: "#c8d6e5", marginTop: "4px", fontWeight: "700" },
@@ -322,7 +389,8 @@ EDGE:
     sBar: { display: "flex", height: "4px", borderRadius: "2px", overflow: "hidden", width: "60px", marginTop: "3px" },
     errBox: { background: "rgba(248,113,113,0.06)", border: "1px solid rgba(248,113,113,0.3)", borderRadius: "6px", padding: "16px", color: "#f87171", fontSize: "12px", lineHeight: "1.7" },
     overlay: { position: "fixed", inset: 0, background: "rgba(8,11,18,0.92)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: "16px" },
-    modal: { background: "#0d1826", border: "1px solid #1a2235", borderRadius: "8px", padding: "20px", maxWidth: "520px", width: "100%", maxHeight: "85vh", overflowY: "auto" },
+    modal: { background: "#0d1826", border: "1px solid #1a2235", borderRadius: "8px", padding: "20px", maxWidth: "560px", width: "100%", maxHeight: "85vh", overflowY: "auto" },
+    askBtn: { width: "100%", background: "linear-gradient(135deg,#22d3ee,#0ea5e9)", color: "#060a0f", border: "none", borderRadius: "6px", padding: "12px", fontSize: "11px", letterSpacing: "2px", textTransform: "uppercase", cursor: "pointer", fontFamily: "'DM Mono',monospace", fontWeight: "700", marginBottom: "14px" },
     filterPanel: { background: "#0a1020", border: "1px solid #1a2235", borderRadius: "6px", padding: "14px", marginBottom: "12px" },
     filterRow: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px", gap: "10px" },
   };
@@ -365,7 +433,7 @@ EDGE:
           <div style={{ textAlign: "center", padding: "60px 20px", color: "#2a3a50" }}>
             <div style={{ fontSize: "52px", marginBottom: "14px", opacity: 0.2 }}>⬡</div>
             <div style={{ fontSize: "11px", letterSpacing: "3px", marginBottom: "8px" }}>POLYMARKET SMART MONEY SCANNER</div>
-            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>ROI-weighted · Filtered · Tracks deltas</div>
+            <div style={{ fontSize: "10px", color: "#1a2a3a" }}>Noise filtered · ROI weighted · Per-market AI advice</div>
           </div>
         )}
 
@@ -374,7 +442,7 @@ EDGE:
             <div style={{ fontSize: "11px", letterSpacing: "1px", color: "#4ade80" }}>{log} <span style={{ color: "#2a3a50" }}>{dots}</span></div>
             <div style={S.bar}><div style={{ height: "100%", background: "linear-gradient(90deg,#4ade80,#22d3ee)", width: prog + "%", transition: "width 0.5s ease", borderRadius: "2px" }} /></div>
             <div style={{ fontSize: "9px", color: "#2a3a50", marginTop: "5px", display: "flex", justifyContent: "space-between" }}>
-              <span>{prog < 10 ? "Cold start: up to 60s…" : ""}</span><span>{prog}%</span>
+              <span>{prog < 10 ? "Cold start: up to 3 min…" : ""}</span><span>{prog}%</span>
             </div>
           </div>
         )}
@@ -388,34 +456,36 @@ EDGE:
 
         {result && (
           <>
-            {/* Stats */}
             <div style={S.statsRow}>
               <div style={S.card()}>
                 <div style={S.lbl}>Filtered Picks</div>
-                <div style={S.val}>{filteredMarkets.length}<span style={{ fontSize: "12px", color: "#2a3a50", marginLeft: "6px" }}>of {markets.length}</span></div>
+                <div style={S.val}>{filteredMarkets.length}<span style={{ fontSize: "12px", color: "#2a3a50", marginLeft: "6px" }}>of {allCleanMarkets.length}</span></div>
               </div>
               <div style={S.card()}>
-                <div style={S.lbl}>Last Scan</div>
-                <div style={{ fontSize: "14px", color: "#c8d6e5", marginTop: "6px", fontWeight: "700" }}>{fmtRel(result.timestamp)}</div>
+                <div style={S.lbl}>Bankroll</div>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "6px" }}>
+                  <span style={{ fontSize: "16px", color: "#4ade80", fontWeight: "700" }}>$</span>
+                  <input type="number" value={bankroll} onChange={e => setBankroll(+e.target.value || 0)}
+                    style={{ background: "#0a1020", border: "1px solid #1a2235", color: "#c8d6e5", padding: "4px 6px", borderRadius: "4px", fontFamily: "inherit", fontSize: "16px", width: "80px", fontWeight: "700" }}/>
+                </div>
               </div>
             </div>
-            <div style={S.statsRow3}>
-              <div style={S.card(top?.recommendation === "YES" ? "rgba(74,222,128,0.25)" : "rgba(248,113,113,0.25)")}>
-                <div style={S.lbl}>Top Filtered Pick</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "8px", marginBottom: "14px" }}>
+              <div style={S.card(top?.recommendation === "YES" ? "rgba(74,222,128,0.25)" : top ? "rgba(248,113,113,0.25)" : "")}>
+                <div style={S.lbl}>Top Filtered Pick · {fmtRel(result.timestamp)}</div>
                 <div style={{ fontSize: "12px", color: top?.recommendation === "YES" ? "#4ade80" : "#f87171", marginTop: "6px", lineHeight: "1.4", fontWeight: "700" }}>
-                  {top?.title?.slice(0, 56)}{top?.title?.length > 56 ? "…" : ""}
-                  <span style={{ fontSize: "10px", marginLeft: "6px", opacity: 0.7 }}>{top?.recommendation} @ {top?.curPrice ? fmtC(top.curPrice) : "?"}</span>
+                  {top?.title?.slice(0, 56) || "—"}{top?.title?.length > 56 ? "…" : ""}
+                  {top && <span style={{ fontSize: "10px", marginLeft: "6px", opacity: 0.7 }}>{top.recommendation} @ {top.curPrice ? fmtC(top.curPrice) : "?"}</span>}
                 </div>
               </div>
             </div>
 
-            {/* Filter panel */}
             <div style={S.filterPanel}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }} onClick={() => setFiltersOpen(!filtersOpen)}>
                 <div style={{ fontSize: "10px", letterSpacing: "2px", color: "#4ade80", textTransform: "uppercase" }}>
-                  ▾ Filters · {filters.minPrice}–{filters.maxPrice}¢ · {filters.minTraders}+ traders · ≤{filters.maxDays}d
+                  ▾ Filters · {filters.minPrice}–{filters.maxPrice}¢ · {filters.minTraders}+ T · ≤{filters.maxDays}d{filters.hideNoise ? " · clean" : ""}
                 </div>
-                <div style={{ fontSize: "9px", color: "#2a3a50" }}>{filtersOpen ? "tap to hide" : "tap to edit"}</div>
+                <div style={{ fontSize: "9px", color: "#2a3a50" }}>{filtersOpen ? "hide" : "edit"}</div>
               </div>
               {filtersOpen && (
                 <div style={{ marginTop: "14px" }}>
@@ -437,6 +507,13 @@ EDGE:
                     <input type="number" min="1" max="365" value={filters.maxDays} onChange={e => setFilters({ ...filters, maxDays: +e.target.value })}/>
                   </div>
                   <div style={S.filterRow}>
+                    <div style={{ fontSize: "10px", color: "#9db8d4" }}>Hide noise (long-shots, resolved)</div>
+                    <button onClick={() => setFilters({ ...filters, hideNoise: !filters.hideNoise })}
+                      style={{ background: filters.hideNoise ? "#4ade80" : "#101c2c", color: filters.hideNoise ? "#060a0f" : "#9db8d4", border: "none", borderRadius: "4px", padding: "5px 12px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
+                      {filters.hideNoise ? "ON" : "OFF"}
+                    </button>
+                  </div>
+                  <div style={S.filterRow}>
                     <div style={{ fontSize: "10px", color: "#9db8d4" }}>Fresh signals only</div>
                     <button onClick={() => setFilters({ ...filters, freshOnly: !filters.freshOnly })}
                       style={{ background: filters.freshOnly ? "#4ade80" : "#101c2c", color: filters.freshOnly ? "#060a0f" : "#9db8d4", border: "none", borderRadius: "4px", padding: "5px 12px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>
@@ -444,9 +521,9 @@ EDGE:
                     </button>
                   </div>
                   <div style={{ display: "flex", gap: "6px", marginTop: "10px" }}>
-                    <button onClick={() => setFilters({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false })}
+                    <button onClick={() => setFilters({ minPrice: 25, maxPrice: 75, minTraders: 5, maxDays: 30, freshOnly: false, hideNoise: true })}
                       style={{ background: "#101c2c", color: "#9db8d4", border: "none", borderRadius: "4px", padding: "6px 10px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>Reset</button>
-                    <button onClick={() => setFilters({ minPrice: 0, maxPrice: 100, minTraders: 1, maxDays: 365, freshOnly: false })}
+                    <button onClick={() => setFilters({ minPrice: 0, maxPrice: 100, minTraders: 1, maxDays: 365, freshOnly: false, hideNoise: false })}
                       style={{ background: "#101c2c", color: "#9db8d4", border: "none", borderRadius: "4px", padding: "6px 10px", fontSize: "9px", letterSpacing: "1px", fontFamily: "inherit", cursor: "pointer" }}>Show all</button>
                   </div>
                 </div>
@@ -480,7 +557,7 @@ EDGE:
               <div style={{ overflowX: "auto", margin: "0 -16px", padding: "0 16px" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead><tr>{["#","Market","Sig","Price","T","Y%","Conv"].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
-                  <tbody>{markets.map((m,i) => <Row key={m.conditionId||i} m={m} i={i}/>)}</tbody>
+                  <tbody>{allCleanMarkets.map((m,i) => <Row key={m.conditionId||i} m={m} i={i}/>)}</tbody>
                 </table>
               </div>
             )}
@@ -490,17 +567,30 @@ EDGE:
 
       {/* Detail modal */}
       {sel && (
-        <div style={S.overlay} onClick={() => setSel(null)}>
+        <div style={S.overlay} onClick={() => { setSel(null); setAskAI({ loading: false, advice: "", market: null }); }}>
           <div style={S.modal} onClick={e => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "14px" }}>
               <span style={{ fontSize: "9px", letterSpacing: "2px", color: "#2a3a50", textTransform: "uppercase" }}>Market Detail</span>
-              <button style={{ background: "none", border: "none", color: "#2a3a50", cursor: "pointer", fontSize: "16px" }} onClick={() => setSel(null)}>✕</button>
+              <button style={{ background: "none", border: "none", color: "#2a3a50", cursor: "pointer", fontSize: "16px" }} onClick={() => { setSel(null); setAskAI({ loading: false, advice: "", market: null }); }}>✕</button>
             </div>
             <div style={{ fontSize: "14px", color: "#c8d6e5", lineHeight: "1.5", marginBottom: "16px" }}>
               {sel.title}
               {sel.isNew && <span style={S.newBadge}>NEW</span>}
               {sel.tradersDelta > 0 && <span style={S.newBadge}>+{sel.tradersDelta} TRADERS</span>}
             </div>
+
+            {/* Ask AI button */}
+            <button style={S.askBtn} onClick={() => askAboutMarket(sel)} disabled={askAI.loading && askAI.market?.conditionId === sel.conditionId}>
+              {askAI.loading && askAI.market?.conditionId === sel.conditionId ? <span className="pulse">◇ ANALYZING...</span> : "💡 ASK AI: SHOULD I BET?"}
+            </button>
+
+            {/* AI advice display */}
+            {askAI.advice && askAI.market?.conditionId === sel.conditionId && (
+              <div style={{ background: "#0a1020", border: "1px solid #22d3ee", borderRadius: "6px", padding: "14px", marginBottom: "14px", whiteSpace: "pre-wrap", fontSize: "11px", lineHeight: "1.7", color: "#c8d6e5" }}>
+                {askAI.advice}
+              </div>
+            )}
+
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "14px" }}>
               {[
                 { l:"Signal", v:sel.recommendation, c:sel.recommendation==="YES"?"#4ade80":"#f87171" },
